@@ -1,0 +1,65 @@
+# Every published port binds to ${BIND_IP}: the Tailscale IP on the VM,
+# 127.0.0.1 locally. Nothing here may ever listen on a public interface —
+# that, plus the cloud firewall's default-deny, is the whole access model.
+# The fleet database lives on a NAMED volume, never a bind mount: worker and
+# mcp share one SQLite file in WAL mode, and WAL's shared-memory coordination
+# breaks across containers on macOS bind mounts (the -wal file gets deleted
+# under the writer and its writes vanish into an orphaned inode). A named
+# volume is a real Linux filesystem, where cross-container WAL is safe.
+services:
+  worker:
+    build: .
+    command: fleet-worker
+    env_file: .env
+    environment:
+      FLEET_DB: /data/fleet.db
+      NTFY_URL: http://ntfy
+    volumes:
+      - fleet-data:/data
+      - ./backups:/backups
+    ports:
+      - "${BIND_IP:-127.0.0.1}:${FLEET_HEALTH_PORT:-8686}:8686"
+    depends_on:
+      - ntfy
+    restart: unless-stopped
+
+  mcp:
+    build: .
+    command: fleet-mcp
+    env_file: .env
+    environment:
+      FLEET_DB: /data/fleet.db
+      FLEET_MCP_HOST: 0.0.0.0
+      FLEET_MCP_PORT: 8765
+    volumes:
+      - fleet-data:/data
+    ports:
+      - "${BIND_IP:-127.0.0.1}:${FLEET_MCP_PORT:-8765}:8765"
+    restart: unless-stopped
+
+  ntfy:
+    image: binwiederhier/ntfy:latest # pin to the pulled digest after first deploy
+    command: serve
+    environment:
+      NTFY_BASE_URL: http://${BIND_IP:-127.0.0.1}:${NTFY_PORT:-8666}
+      NTFY_CACHE_FILE: /var/lib/ntfy/cache.db
+      NTFY_AUTH_FILE: /var/lib/ntfy/user.db
+      # deny-all + tokens on the VM; local smoke tests override to read-write
+      NTFY_AUTH_DEFAULT_ACCESS: ${NTFY_DEFAULT_ACCESS:-deny-all}
+      NTFY_ENABLE_LOGIN: "true"
+    volumes:
+      - ./data/ntfy:/var/lib/ntfy
+    ports:
+      - "${BIND_IP:-127.0.0.1}:${NTFY_PORT:-8666}:80"
+    restart: unless-stopped
+
+  changedetection:
+    image: dgtlmoon/changedetection.io:latest # pin to the pulled digest after first deploy
+    volumes:
+      - ./data/changedetection:/datastore
+    ports:
+      - "${BIND_IP:-127.0.0.1}:${CHANGEDETECTION_PORT:-5000}:5000"
+    restart: unless-stopped
+
+volumes:
+  fleet-data:
