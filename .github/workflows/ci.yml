@@ -33,8 +33,8 @@ jobs:
         # 3.12 is what the deploy image runs; 3.13 catches deprecations early.
         python: ["3.12", "3.13"]
     steps:
-      - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10
+      - uses: actions/checkout@v7.0.1
+      - uses: astral-sh/setup-uv@v10.0.1
         with:
           python-version: ${{ matrix.python }}
           enable-cache: true
@@ -49,8 +49,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10
+      - uses: actions/checkout@v7.0.1
+      - uses: astral-sh/setup-uv@v10.0.1
 
       - name: Lint (ruff)
         run: uvx ruff@${{ env.RUFF_VERSION }} check .
@@ -97,7 +97,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
 
       - name: Deploy artifact sanity
         # The image is the thing that actually ships; prove the CLI it carries
