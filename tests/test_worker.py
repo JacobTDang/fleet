@@ -6,6 +6,7 @@ import httpx
 import pytest
 
 from fleet import db, jobs
+from fleet.checkers import ScrapeConfig
 from fleet.jobrunner import FAR_FUTURE
 from fleet.llm import LlmResult
 from fleet.notify import NotifyError
@@ -43,6 +44,7 @@ def make_env(handler, fail_notify=False):
         "fail_threshold": 3,
         "now_fn": lambda: NOW,
         "health": Health(tick_seconds=5),
+        "scrape": None,
     }
 
 
@@ -439,3 +441,46 @@ async def test_a_failed_guard_does_not_punish_sibling_watchers(conn):
     assert db.domain_backoff(conn, "shop.com") is None, "a guard miss must not pause the domain"
     assert db.recent_snapshots(conn, 1), "but it must still keep the body for forensics"
     assert db.recent_errors(conn)[0]["detail"].startswith("expected pattern")
+
+
+SCRAPE_CFG = ScrapeConfig(url="http://firecrawl:3002/v2/scrape", key="k")
+
+
+def scrape_response(markdown):
+    return httpx.Response(200, json={"success": True, "data": {
+        "markdown": markdown, "metadata": {"statusCode": 200}}})
+
+
+async def test_scrape_backed_watcher_detects_change_through_the_provider(conn):
+    db.create_watcher(conn, name="spa", kind="http_text", target="https://spa.example",
+                      extract=r"Status: (\w+)", interval_seconds=300, fetch_via="scrape")
+    page = {"md": "# Tickets\n\nStatus: soldout"}
+    env = make_env(lambda req: scrape_response(page["md"]))
+    env["scrape"] = SCRAPE_CFG
+    await run_once(conn, env)
+    assert db.get_state(conn, 1)["last_value"] == "soldout"
+    page["md"] = "# Tickets\n\nStatus: available"
+    db.update_state(conn, 1, next_run_at=0)
+    await run_once(conn, env)
+    assert len(env["notifier"].sent) == 1
+    assert "available" in env["notifier"].sent[0][1]
+
+
+async def test_scrape_budget_stops_spending_and_says_so_once(conn):
+    db.create_watcher(conn, name="spa", kind="http_text", target="https://spa.example",
+                      interval_seconds=300, fetch_via="scrape")
+    called = {"n": 0}
+
+    def handler(req):
+        called["n"] += 1
+        return scrape_response("hello")
+
+    env = make_env(handler)
+    env["scrape"] = SCRAPE_CFG
+    env["scrape_budget"] = 2
+    for _ in range(4):
+        db.update_state(conn, 1, next_run_at=0)
+        await run_once(conn, env)
+    assert called["n"] == 2, "the budget must actually stop the spending"
+    assert sum("budget" in t.lower() for t, _, _ in env["notifier"].sent) == 1
+    assert db.get_state(conn, 1)["consecutive_failures"] == 0, "our budget is not the site failing"

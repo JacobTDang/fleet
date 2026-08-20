@@ -10,7 +10,9 @@ from fleet import cron as cron_mod
 
 KINDS = ("http_json", "http_text", "script", "webhook")
 MIN_INTERVAL = 30
-SCHEMA_VERSION = 3
+SCRAPE_MIN_INTERVAL = 300   # a rendered fetch costs credits or a browser
+FETCH_VIA = ("direct", "scrape")
+SCHEMA_VERSION = 4
 BASE_BACKOFF = 900.0      # 15 min after the first refusal
 MAX_BACKOFF = 6 * 3600.0  # never sit on a domain longer than 6h
 
@@ -35,6 +37,7 @@ CREATE TABLE IF NOT EXISTS watchers (
   headers TEXT,
   timeout_seconds INTEGER,
   alert_max_per_hour INTEGER NOT NULL DEFAULT 0,
+  fetch_via TEXT NOT NULL DEFAULT 'direct',
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE TABLE IF NOT EXISTS state (
@@ -147,7 +150,7 @@ _STATE_FIELDS = {
 _WATCHER_FIELDS = {"name", "target", "extract", "interval_seconds", "notify_title", "kind",
                    "cron", "handler_prompt", "handler_allow_fleetctl", "fallback_ok",
                    "expect_pattern", "min_change_pct", "headers", "timeout_seconds",
-                   "alert_max_per_hour"}
+                   "alert_max_per_hour", "fetch_via"}
 
 
 def connect(path):
@@ -174,7 +177,8 @@ def connect_ro(path):
 _V3_COLUMNS = {
     "watchers": [("expect_pattern", "TEXT"), ("min_change_pct", "REAL"),
                  ("headers", "TEXT"), ("timeout_seconds", "INTEGER"),
-                 ("alert_max_per_hour", "INTEGER NOT NULL DEFAULT 0")],
+                 ("alert_max_per_hour", "INTEGER NOT NULL DEFAULT 0"),
+                 ("fetch_via", "TEXT NOT NULL DEFAULT 'direct'")],
     "state": [("alert_anchor", "TEXT")],
     "checks": [("duration_ms", "INTEGER")],
 }
@@ -288,11 +292,15 @@ def create_watcher(conn, *, name, kind, target, extract=None,
                    interval_seconds=300, notify_title=None, cron=None,
                    handler_prompt=None, handler_allow_fleetctl=False, fallback_ok=True,
                    expect_pattern=None, headers=None, min_change_pct=None,
-                   timeout_seconds=None, alert_max_per_hour=0):
+                   timeout_seconds=None, alert_max_per_hour=0, fetch_via="direct"):
     if kind not in KINDS:
         raise ValueError(f"kind must be one of {KINDS}, got: {kind!r}")
-    if interval_seconds < MIN_INTERVAL:
-        raise ValueError(f"interval_seconds must be >= {MIN_INTERVAL} (politeness floor)")
+    if fetch_via not in FETCH_VIA:
+        raise ValueError(f"fetch_via must be one of {FETCH_VIA}, got: {fetch_via!r}")
+    floor = SCRAPE_MIN_INTERVAL if fetch_via == "scrape" else MIN_INTERVAL
+    if interval_seconds < floor:
+        raise ValueError(f"interval_seconds must be >= {floor}"
+                         f" for fetch_via={fetch_via} (cost/politeness floor)")
     if cron is not None:
         cron_mod.validate(cron)
     _validate_guards(expect_pattern, headers, min_change_pct, timeout_seconds,
@@ -303,11 +311,12 @@ def create_watcher(conn, *, name, kind, target, extract=None,
         "INSERT INTO watchers (name, kind, target, extract, interval_seconds, domain,"
         " notify_title, cron, handler_prompt, handler_allow_fleetctl, fallback_ok,"
         " webhook_secret, expect_pattern, headers, min_change_pct, timeout_seconds,"
-        " alert_max_per_hour) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        " alert_max_per_hour, fetch_via)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (name, kind, target, extract, interval_seconds, domain, notify_title, cron,
          handler_prompt, 1 if handler_allow_fleetctl else 0, 1 if fallback_ok else 0,
          webhook_secret, expect_pattern, headers, min_change_pct, timeout_seconds,
-         alert_max_per_hour or 0),
+         alert_max_per_hour or 0, fetch_via),
     )
     conn.execute("INSERT INTO state (watcher_id) VALUES (?)", (cur.lastrowid,))
     conn.commit()
@@ -482,6 +491,13 @@ def recent_snapshots(conn, watcher_id, limit=SNAPSHOT_KEEP):
     rows = conn.execute("SELECT * FROM snapshots WHERE watcher_id = ?"
                         " ORDER BY id DESC LIMIT ?", (watcher_id, limit))
     return [dict(r) for r in rows]
+
+
+def scrape_checks_today(conn):
+    """Rendered fetches are the metered resource; plain GETs are free."""
+    return conn.execute(
+        "SELECT COUNT(*) FROM checks c JOIN watchers w ON w.id = c.watcher_id"
+        " WHERE w.fetch_via = 'scrape' AND c.ts >= date('now')").fetchone()[0]
 
 
 def count_alerts(conn, watcher_id, *, kind=None, title_like=None, within_hours=1):

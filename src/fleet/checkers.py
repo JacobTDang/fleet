@@ -13,8 +13,59 @@ import httpx
 
 SCRIPT_TIMEOUT = 60.0
 HTTP_TIMEOUT = 30.0
+SCRAPE_TIMEOUT = 120.0   # rendering a page is slow; that is the point
 BLOCK_CODES = (401, 403, 407, 429)  # "not you, not now" — back the whole domain off
 _ENV_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+@dataclass
+class ScrapeConfig:
+    """Fetch through a rendering / anti-bot service instead of a plain GET.
+
+    Deliberately provider-agnostic: any API that takes JSON containing the URL
+    and returns the page is usable, so Firecrawl (self-hosted or cloud),
+    browserless, or a paid scraping API are configuration, not code. The
+    default body is Firecrawl's v2 shape.
+
+    maxAge=0 is load-bearing: Firecrawl serves cached pages by default, and a
+    monitor fed from a cache would look healthy while never seeing a change.
+    """
+
+    DEFAULT_BODY = ('{"url": "{{url}}", "formats": ["markdown"],'
+                    ' "onlyMainContent": true, "maxAge": 0}')
+    DEFAULT_PATH = "data.markdown"
+
+    url: str
+    key: str | None = None
+    body_template: str = DEFAULT_BODY
+    content_path: str = DEFAULT_PATH
+    timeout: float = SCRAPE_TIMEOUT
+
+    @classmethod
+    def from_env(cls, env=None):
+        env = os.environ if env is None else env
+        url = env.get("FLEET_SCRAPE_URL")
+        if not url:
+            return None
+        return cls(
+            url=url,
+            key=env.get("FLEET_SCRAPE_KEY") or None,
+            body_template=env.get("FLEET_SCRAPE_BODY") or cls.DEFAULT_BODY,
+            content_path=env.get("FLEET_SCRAPE_PATH", cls.DEFAULT_PATH),
+            timeout=float(env.get("FLEET_SCRAPE_TIMEOUT", SCRAPE_TIMEOUT)),
+        )
+
+
+def _fill_template(obj, url):
+    """Substitute into parsed JSON, never into the raw text: a URL with a quote
+    or a backslash would otherwise produce an unparseable body."""
+    if isinstance(obj, str):
+        return obj.replace("{{url}}", url)
+    if isinstance(obj, list):
+        return [_fill_template(v, url) for v in obj]
+    if isinstance(obj, dict):
+        return {k: _fill_template(v, url) for k, v in obj.items()}
+    return obj
 
 
 @dataclass
@@ -116,36 +167,7 @@ async def _http_check(watcher, client):
     if not resp.is_success:
         return CheckResult(ok=False, error=f"HTTP {resp.status_code}", **validators)
 
-    expect = watcher.get("expect_pattern")
-    if expect and not re.search(expect, resp.text):
-        # 200 OK with the wrong page: a bot wall, a soft 404, a login redirect.
-        # Reporting this as a change would silently re-point the watcher at it.
-        # NOT blocked: this could be a bot wall or an equally likely wrong
-        # regex, and the evidence cannot tell them apart. Backing off the whole
-        # domain on a guess would pause sibling watchers that are working.
-        return CheckResult(ok=False, **validators, body=resp.text[:64_000],
-                           error=f"expected pattern not found: {expect}")
-
-    extract = watcher.get("extract")
-    if watcher["kind"] == "http_json":
-        try:
-            data = resp.json()
-        except (json.JSONDecodeError, ValueError) as e:
-            return CheckResult(ok=False, error=f"invalid JSON: {e}", **validators)
-        if extract is None:
-            return CheckResult(ok=True, value=_as_text(data), **validators)
-        try:
-            return CheckResult(ok=True, value=_as_text(_dot_path(data, extract)), **validators)
-        except (KeyError, IndexError, TypeError, ValueError):
-            return CheckResult(ok=False, error=f"extract path not found: {extract}", **validators)
-
-    # http_text
-    if extract is None:
-        return CheckResult(ok=True, value=resp.text, **validators)
-    m = re.search(extract, resp.text)
-    if m is None:
-        return CheckResult(ok=False, error=f"regex matched nothing: {extract}", **validators)
-    return CheckResult(ok=True, value=m.group(1) if m.groups() else m.group(0), **validators)
+    return _extract(watcher, resp.text, validators)
 
 
 async def _script_check(watcher, timeout):
@@ -166,8 +188,93 @@ async def _script_check(watcher, timeout):
     return CheckResult(ok=True, value=stdout.decode(errors="replace").strip())
 
 
-async def run_check(watcher, client, *, script_timeout=SCRIPT_TIMEOUT):
+async def _scrape_check(watcher, client, cfg):
+    """Fetch via the scrape provider, then hand the returned page to exactly the
+    same extraction and guards a direct fetch uses."""
+    try:
+        body = _fill_template(json.loads(cfg.body_template), watcher["target"])
+    except (json.JSONDecodeError, TypeError) as e:
+        return CheckResult(ok=False, error=f"scrape body template unusable: {e}")
+    headers = {"Content-Type": "application/json"}
+    if cfg.key:
+        headers["Authorization"] = f"Bearer {cfg.key}"
+    started = time.monotonic()
+    try:
+        resp = await client.post(cfg.url, json=body, headers=headers, timeout=cfg.timeout)
+    except httpx.HTTPError as e:
+        return CheckResult(ok=False, error=f"scrape provider {type(e).__name__}: {e}",
+                           duration_ms=int((time.monotonic() - started) * 1000))
+    elapsed = int((time.monotonic() - started) * 1000)
+
+    if not resp.is_success:
+        # the PROVIDER refused us (quota, auth) — that is not the target site
+        # refusing, so it must not back the target domain off
+        return CheckResult(ok=False, duration_ms=elapsed,
+                           error=f"scrape provider HTTP {resp.status_code}")
+
+    if cfg.content_path:
+        try:
+            payload = resp.json()
+        except (json.JSONDecodeError, ValueError) as e:
+            return CheckResult(ok=False, error=f"scrape provider sent non-JSON: {e}",
+                               duration_ms=elapsed)
+        if payload.get("success") is False:
+            return CheckResult(ok=False, duration_ms=elapsed,
+                               error=f"scrape failed: {payload.get('error', 'unknown')}")
+        site_status = None
+        meta = payload.get("data", {}).get("metadata") if isinstance(payload.get("data"), dict) else None
+        if isinstance(meta, dict):
+            site_status = meta.get("statusCode")
+        if site_status in BLOCK_CODES:
+            return CheckResult(ok=False, blocked=True, duration_ms=elapsed,
+                               status_code=site_status,
+                               error=f"HTTP {site_status} (refused) via scrape")
+        try:
+            content = _as_text(_dot_path(payload, cfg.content_path))
+        except (KeyError, IndexError, TypeError, ValueError):
+            return CheckResult(ok=False, duration_ms=elapsed,
+                               error=f"scrape response has no {cfg.content_path}")
+    else:
+        content = resp.text
+
+    return _extract(watcher, content, {"duration_ms": elapsed})
+
+
+def _extract(watcher, text, extras=None):
+    """Turn fetched page text into a value: dot-path for JSON, regex for text,
+    plus the expect_pattern guard that both kinds share."""
+    extras = extras or {}
+    expect = watcher.get("expect_pattern")
+    if expect and not re.search(expect, text):
+        return CheckResult(ok=False, body=text[:64_000], **extras,
+                           error=f"expected pattern not found: {expect}")
+    extract = watcher.get("extract")
+    if watcher["kind"] == "http_json":
+        try:
+            data = json.loads(text)
+        except (json.JSONDecodeError, ValueError) as e:
+            return CheckResult(ok=False, error=f"invalid JSON: {e}", **extras)
+        if extract is None:
+            return CheckResult(ok=True, value=_as_text(data), **extras)
+        try:
+            return CheckResult(ok=True, value=_as_text(_dot_path(data, extract)), **extras)
+        except (KeyError, IndexError, TypeError, ValueError):
+            return CheckResult(ok=False, error=f"extract path not found: {extract}", **extras)
+    if extract is None:
+        return CheckResult(ok=True, value=text, **extras)
+    m = re.search(extract, text)
+    if m is None:
+        return CheckResult(ok=False, error=f"regex matched nothing: {extract}", **extras)
+    return CheckResult(ok=True, value=m.group(1) if m.groups() else m.group(0), **extras)
+
+
+async def run_check(watcher, client, *, script_timeout=SCRIPT_TIMEOUT, scrape=None):
     kind = watcher["kind"]
+    if kind in ("http_json", "http_text") and watcher.get("fetch_via") == "scrape":
+        if scrape is None:
+            return CheckResult(ok=False, error="scrape transport not configured"
+                                               " (set FLEET_SCRAPE_URL)")
+        return await _scrape_check(watcher, client, scrape)
     if kind in ("http_json", "http_text"):
         return await _http_check(watcher, client)
     if kind == "script":
