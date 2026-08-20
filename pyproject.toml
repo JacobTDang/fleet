@@ -12,6 +12,7 @@ dependencies = [
 [project.scripts]
 fleet-worker = "fleet.worker:main"
 fleet-mcp = "fleet.mcp_server:main"
+fleetctl = "fleet.fleetctl:main"
 
 [dependency-groups]
 dev = [
