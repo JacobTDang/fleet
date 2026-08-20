@@ -225,10 +225,16 @@ async def _scrape_check(watcher, client, cfg):
         meta = payload.get("data", {}).get("metadata") if isinstance(payload.get("data"), dict) else None
         if isinstance(meta, dict):
             site_status = meta.get("statusCode")
-        if site_status in BLOCK_CODES:
-            return CheckResult(ok=False, blocked=True, duration_ms=elapsed,
-                               status_code=site_status,
-                               error=f"HTTP {site_status} (refused) via scrape")
+        if isinstance(site_status, int) and site_status >= 400:
+            # Firecrawl reports success:true for 4xx/5xx pages — the real status
+            # hides in the metadata. Extracting from an error page would report
+            # a change and then quietly monitor the error page forever.
+            refused = site_status in BLOCK_CODES
+            markdown = payload.get("data", {}).get("markdown")
+            return CheckResult(ok=False, blocked=refused, duration_ms=elapsed,
+                               status_code=site_status, body=(markdown or "")[:64_000],
+                               error=f"HTTP {site_status}"
+                                     f"{' (refused)' if refused else ''} via scrape")
         try:
             content = _as_text(_dot_path(payload, cfg.content_path))
         except (KeyError, IndexError, TypeError, ValueError):
@@ -259,12 +265,16 @@ def _extract(watcher, text, extras=None):
         try:
             return CheckResult(ok=True, value=_as_text(_dot_path(data, extract)), **extras)
         except (KeyError, IndexError, TypeError, ValueError):
-            return CheckResult(ok=False, error=f"extract path not found: {extract}", **extras)
+            # keep the payload: an extract that misses is almost always fixed by
+            # looking at what actually came back
+            return CheckResult(ok=False, body=text[:64_000], **extras,
+                               error=f"extract path not found: {extract}")
     if extract is None:
         return CheckResult(ok=True, value=text, **extras)
     m = re.search(extract, text)
     if m is None:
-        return CheckResult(ok=False, error=f"regex matched nothing: {extract}", **extras)
+        return CheckResult(ok=False, body=text[:64_000], **extras,
+                           error=f"regex matched nothing: {extract}")
     return CheckResult(ok=True, value=m.group(1) if m.groups() else m.group(0), **extras)
 
 
