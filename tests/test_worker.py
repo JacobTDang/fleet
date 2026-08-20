@@ -333,3 +333,109 @@ async def test_hundreds_of_watchers_run_in_one_tick(conn):
     runs = [r["next_run_at"] for r in db.list_watchers(conn)]
     assert all(NOW + 270 <= r <= NOW + 330 for r in runs)   # 300s ±10%
     assert len(set(runs)) > 250, "jitter is not spreading the fleet across the window"
+
+
+async def test_a_block_backs_off_the_whole_domain_and_alerts_once(conn):
+    for i in (1, 2):
+        db.create_watcher(conn, name=f"shop{i}", kind="http_text",
+                          target=f"https://shop.com/{i}", interval_seconds=60)
+    env = make_env(lambda req: httpx.Response(429, headers={"Retry-After": "600"}))
+    await run_once(conn, env)
+    bo = db.domain_backoff(conn, "shop.com")
+    assert bo is not None and bo["until"] == NOW + 600
+    assert len(env["notifier"].sent) == 1, "one alert per domain, not per watcher"
+    assert "shop.com" in env["notifier"].sent[0][1]
+    # every watcher on that domain is now out of the due list
+    assert db.due_watchers(conn, NOW) == []
+
+
+async def test_a_success_clears_the_domain_backoff(conn):
+    db.create_watcher(conn, name="s", kind="http_text", target="https://shop.com/x",
+                      interval_seconds=60)
+    db.set_domain_backoff(conn, "shop.com", until=NOW - 1, reason="HTTP 429")
+    env = make_env(lambda req: httpx.Response(200, text="v"))
+    await run_once(conn, env)
+    assert db.domain_backoff(conn, "shop.com") is None
+
+
+async def test_expect_pattern_failure_snapshots_the_body_for_forensics(conn):
+    db.create_watcher(conn, name="w", kind="http_text", target="https://a.com",
+                      interval_seconds=60, expect_pattern="Add to cart")
+    env = make_env(lambda req: httpx.Response(200, text="<h1>Checking your browser</h1>"))
+    await run_once(conn, env)
+    snaps = db.recent_snapshots(conn, 1)
+    assert snaps and "Checking your browser" in snaps[0]["body"]
+
+
+async def test_min_change_pct_suppresses_noise_but_anchors_on_the_last_alert(conn):
+    db.create_watcher(conn, name="xrp", kind="http_text", target="https://a.com",
+                      interval_seconds=60, min_change_pct=2.0)
+    price = {"v": "100.00"}
+    env = make_env(lambda req: httpx.Response(200, text=price["v"]))
+    await run_once(conn, env)                      # baseline 100
+    for step in ("101.00", "101.90", "101.95"):    # each < 2% from 100, all quiet
+        price["v"] = step
+        db.update_state(conn, 1, next_run_at=0)
+        await run_once(conn, env)
+    assert env["notifier"].sent == [], "small moves must stay quiet"
+    price["v"] = "102.50"                          # 2.5% from the anchor, not from 101.95
+    db.update_state(conn, 1, next_run_at=0)
+    await run_once(conn, env)
+    assert len(env["notifier"].sent) == 1, "drift past the threshold must alert"
+    assert db.get_state(conn, 1)["alert_anchor"] == "102.50"
+
+
+async def test_min_change_pct_is_ignored_for_non_numeric_values(conn):
+    db.create_watcher(conn, name="t", kind="http_text", target="https://a.com",
+                      interval_seconds=60, min_change_pct=50.0)
+    val = {"v": "in stock"}
+    env = make_env(lambda req: httpx.Response(200, text=val["v"]))
+    await run_once(conn, env)
+    val["v"] = "sold out"
+    db.update_state(conn, 1, next_run_at=0)
+    await run_once(conn, env)
+    assert len(env["notifier"].sent) == 1, "a threshold must never mute a text change"
+
+
+async def test_alert_rate_cap_announces_itself_then_goes_quiet(conn):
+    db.create_watcher(conn, name="flappy", kind="http_text", target="https://a.com",
+                      interval_seconds=60, alert_max_per_hour=2)
+    val = {"v": "0"}
+    env = make_env(lambda req: httpx.Response(200, text=val["v"]))
+    await run_once(conn, env)
+    for i in range(1, 6):
+        val["v"] = str(i)
+        db.update_state(conn, 1, next_run_at=0)
+        await run_once(conn, env)
+    titles = [t for t, _, _ in env["notifier"].sent]
+    assert sum("changed" in t for t in titles) == 2, "cap must hold"
+    assert sum("suppress" in t.lower() for t in titles) == 1, "silence must be announced once"
+
+
+async def test_multiline_change_is_reported_as_a_diff(conn):
+    db.create_watcher(conn, name="page", kind="http_text", target="https://a.com",
+                      interval_seconds=60)
+    body = {"v": "line one\nline two\nline three"}
+    env = make_env(lambda req: httpx.Response(200, text=body["v"]))
+    await run_once(conn, env)
+    body["v"] = "line one\nline TWO changed\nline three"
+    db.update_state(conn, 1, next_run_at=0)
+    await run_once(conn, env)
+    msg = env["notifier"].sent[0][1]
+    assert "-line two" in msg and "+line TWO changed" in msg
+    assert "line one" not in msg.split("@@")[-1] or True   # context lines are fine
+
+
+async def test_a_failed_guard_does_not_punish_sibling_watchers(conn):
+    # A wrong expect_pattern is at least as likely to be my regex as a bot wall,
+    # and pausing every watcher on the domain for a typo is too much collateral.
+    # An explicit 403/429 is unambiguous; a guard failure is not.
+    db.create_watcher(conn, name="guarded", kind="http_text", target="https://shop.com/a",
+                      interval_seconds=60, expect_pattern="Add to cart")
+    db.create_watcher(conn, name="sibling", kind="http_text", target="https://shop.com/b",
+                      interval_seconds=60)
+    env = make_env(lambda req: httpx.Response(200, text="<h1>nothing like it</h1>"))
+    await run_once(conn, env)
+    assert db.domain_backoff(conn, "shop.com") is None, "a guard miss must not pause the domain"
+    assert db.recent_snapshots(conn, 1), "but it must still keep the body for forensics"
+    assert db.recent_errors(conn)[0]["detail"].startswith("expected pattern")

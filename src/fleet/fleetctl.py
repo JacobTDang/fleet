@@ -21,6 +21,7 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("watchers")
     sub.add_parser("jobs")
+    sub.add_parser("domains")
     p = sub.add_parser("runs")
     p.add_argument("job")
     p.add_argument("-n", type=int, default=20)
@@ -54,6 +55,8 @@ def _dispatch(conn, args):
         _emit(db.list_watchers(conn))
     elif args.cmd == "jobs":
         _emit(jobs.list_jobs(conn))
+    elif args.cmd == "domains":
+        _emit(db.active_backoffs(conn, time.time()))
     elif args.cmd == "alerts":
         _emit(db.recent_alerts(conn, limit=args.n))
     elif args.cmd == "runs":

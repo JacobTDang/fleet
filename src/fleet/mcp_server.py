@@ -35,19 +35,33 @@ def _resolve(conn, ident):
 def watcher_create(name: str, kind: str, target: str, extract: str | None = None,
                    interval_seconds: int = 300, notify_title: str | None = None,
                    cron: str | None = None, handler_prompt: str | None = None,
-                   fallback_ok: bool = True) -> dict:
+                   fallback_ok: bool = True, expect_pattern: str | None = None,
+                   headers: str | None = None, min_change_pct: float | None = None,
+                   timeout_seconds: int | None = None,
+                   alert_max_per_hour: int = 0) -> dict:
     """Create a watcher. kind: http_json (extract=dot.path), http_text
     (extract=regex, first group), script (target=shell command, stdout is the
     value), or webhook (value is POSTed to /hook/<name>/<secret>; the secret
     is in the returned row — save it, it is shown here only). Alerts fire on
     change. cron (5-field) replaces the interval with exact-time scheduling.
     handler_prompt adds LLM triage of each change; fallback_ok=False keeps the
-    handler off the free fallback tier for private data."""
+    handler off the free fallback tier for private data.
+
+    Robustness guards: expect_pattern (regex the page MUST contain, else the
+    check is an error — catches bot walls and soft 404s posing as changes);
+    headers (JSON object; use "${ENV_VAR}" for API keys so secrets stay out of
+    the database); min_change_pct (numeric values only alert on a move this
+    large, measured from the last alerted value); timeout_seconds;
+    alert_max_per_hour (0 = uncapped; the cap announces itself once)."""
     with _conn() as conn:
         w = db.create_watcher(conn, name=name, kind=kind, target=target,
                               extract=extract, interval_seconds=interval_seconds,
                               notify_title=notify_title, cron=cron,
-                              handler_prompt=handler_prompt, fallback_ok=fallback_ok)
+                              handler_prompt=handler_prompt, fallback_ok=fallback_ok,
+                              expect_pattern=expect_pattern, headers=headers,
+                              min_change_pct=min_change_pct,
+                              timeout_seconds=timeout_seconds,
+                              alert_max_per_hour=alert_max_per_hour)
         db.record_audit(conn, source="mcp", entity="watcher", entity_id=w["id"],
                         action="create", detail={"kind": kind, "target": target})
         return w
@@ -62,12 +76,20 @@ def watcher_list(enabled_only: bool = False) -> list[dict]:
 def watcher_update(ident: int | str, name: str | None = None, target: str | None = None,
                    extract: str | None = None, interval_seconds: int | None = None,
                    notify_title: str | None = None, cron: str | None = None,
-                   handler_prompt: str | None = None) -> dict:
+                   handler_prompt: str | None = None, expect_pattern: str | None = None,
+                   headers: str | None = None, min_change_pct: float | None = None,
+                   timeout_seconds: int | None = None,
+                   alert_max_per_hour: int | None = None) -> dict:
     """Update a watcher (by id or name). Only provided fields change."""
     fields = {k: v for k, v in dict(name=name, target=target, extract=extract,
                                     interval_seconds=interval_seconds,
                                     notify_title=notify_title, cron=cron,
-                                    handler_prompt=handler_prompt).items() if v is not None}
+                                    handler_prompt=handler_prompt,
+                                    expect_pattern=expect_pattern, headers=headers,
+                                    min_change_pct=min_change_pct,
+                                    timeout_seconds=timeout_seconds,
+                                    alert_max_per_hour=alert_max_per_hour
+                                    ).items() if v is not None}
     with _conn() as conn:
         w = _resolve(conn, ident)
         db.update_watcher(conn, w["id"], **fields)
@@ -126,6 +148,22 @@ def recent_alerts(limit: int = 20) -> list[dict]:
     """Most recent alerts, newest first."""
     with _conn() as conn:
         return db.recent_alerts(conn, limit=limit)
+
+
+def domain_status() -> list[dict]:
+    """Domains fleet is currently backing off from (a 429/403 pauses every
+    watcher on that site, because they all share one egress IP). Empty is the
+    healthy answer."""
+    with _conn() as conn:
+        return db.active_backoffs(conn, time.time())
+
+
+def watcher_snapshots(ident: int | str, limit: int = 3) -> list[dict]:
+    """Raw response bodies kept from checks that were refused or failed their
+    expect_pattern — what the site actually served when it stopped working."""
+    with _conn() as conn:
+        w = _resolve(conn, ident)
+        return db.recent_snapshots(conn, w["id"], limit=limit)
 
 
 def recent_errors(limit: int = 20) -> list[dict]:
@@ -239,7 +277,7 @@ def job_history(ident: int | str, limit: int = 20) -> list[dict]:
 
 for _fn in (watcher_create, watcher_list, watcher_update, watcher_pause,
             watcher_resume, watcher_delete, watcher_test,
-            fleet_stats, recent_alerts, recent_errors,
+            fleet_stats, recent_alerts, recent_errors, domain_status, watcher_snapshots,
             job_create, job_list, job_update, job_pause, job_resume,
             job_delete, job_run_now, job_history):
     mcp.tool()(_fn)
