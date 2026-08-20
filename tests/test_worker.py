@@ -10,7 +10,7 @@ from fleet.jobrunner import FAR_FUTURE
 from fleet.llm import LlmResult
 from fleet.notify import NotifyError
 from fleet.scheduler import DomainGate
-from fleet.worker import Health, process_watcher, start_health_server, tick
+from fleet.worker import Health, JobPool, process_watcher, start_health_server, tick
 from fleet.worker import tick as worker_tick
 
 NOW = 1_000_000.0
@@ -273,3 +273,63 @@ async def test_tick_runs_jobs_and_watchers(conn):
     assert n == 2
     assert jobs.recent_runs(conn, job_id=j["id"])[0]["status"] == "ok"
     assert any(m == "done" for _, m, _ in env["notifier"].sent)
+
+
+async def test_webhook_push_arriving_mid_check_is_not_lost(conn):
+    w = db.create_watcher(conn, name="hook", kind="webhook", target="tv")
+    db.update_state(conn, w["id"], pushed_value="b", next_run_at=0)
+    # the engine read "a" at due-time; "b" landed while the check was running
+    row = dict(db.due_watchers(conn, NOW)[0], pushed_value="a")
+    env = make_env(lambda req: httpx.Response(500))
+    await process_watcher(conn, row, **env)
+    s = db.get_state(conn, w["id"])
+    assert s["pushed_value"] == "b", "a push that arrived mid-check was swallowed"
+    assert s["next_run_at"] == 0, "the newer push must be picked up on the next tick"
+
+
+async def test_job_next_run_lands_exactly_on_the_cron_boundary(conn):
+    from fleet import cron
+    j = jobs.create_job(conn, now=NOW, name="j", kind="script", target="true",
+                        schedule="0 9 * * *", tz="America/New_York")
+    jobs.update_job_state(conn, j["id"], next_run_at=NOW)
+    env = make_env(lambda req: httpx.Response(200, text="v"))
+    await worker_tick(conn, **env)
+    assert jobs.list_jobs(conn)[0]["next_run_at"] == cron.next_fire("0 9 * * *",
+                                                                   "America/New_York", NOW)
+
+
+async def test_a_slow_job_does_not_block_the_tick_or_the_heartbeat(conn):
+    j = jobs.create_job(conn, now=NOW, name="slow", kind="script", target="sleep 2",
+                        schedule="* * * * *", tz="UTC", timeout_seconds=30,
+                        notify_policy="never")
+    jobs.update_job_state(conn, j["id"], next_run_at=NOW)
+    db.create_watcher(conn, name="w", kind="http_text", target="https://a.com",
+                      interval_seconds=60)
+    env = make_env(lambda req: httpx.Response(200, text="v"))
+    pool = JobPool(5)
+    n = await worker_tick(conn, job_pool=pool, **env)
+    assert n == 2
+    # tick returned while the job is still running — it must not wait on it
+    assert jobs.list_jobs(conn)[0]["running"] == 1
+    assert env["health"].payload(NOW)[1]["ticks"] == 1, "heartbeat blocked by a slow job"
+    # and watchers keep being checked while that job runs
+    db.update_state(conn, 1, next_run_at=0)
+    await worker_tick(conn, job_pool=pool, **env)
+    assert db.get_state(conn, 1)["last_hash"] is not None, "slow job starved the watchers"
+    await pool.drain()
+    assert jobs.recent_runs(conn, job_id=j["id"])[0]["status"] == "ok"
+
+
+async def test_hundreds_of_watchers_run_in_one_tick(conn):
+    # The whole premise: a watcher is a row, not a process. 300 of them are one
+    # tick's worth of concurrent I/O, spread by jitter so they never realign.
+    for i in range(300):
+        db.create_watcher(conn, name=f"w{i}", kind="http_text",
+                          target=f"https://site{i}.example/x", interval_seconds=300)
+    env = make_env(lambda req: httpx.Response(200, text="v"))
+    n = await worker_tick(conn, **env)
+    assert n == 300
+    assert conn.execute("SELECT COUNT(*) FROM checks").fetchone()[0] == 300
+    runs = [r["next_run_at"] for r in db.list_watchers(conn)]
+    assert all(NOW + 270 <= r <= NOW + 330 for r in runs)   # 300s ±10%
+    assert len(set(runs)) > 250, "jitter is not spreading the fleet across the window"

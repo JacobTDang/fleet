@@ -53,6 +53,10 @@ Cron-scheduled tasks sharing the same engine, DB, and alerting:
   `on_output` (cron etiquette: only when stdout is non-empty) · `never`.
 - **Semantics**: missed fires run late within a 1h grace window (alert+skip
   beyond it); overlapping fires skip, never stack; DST handled per-job tz.
+- **Long jobs block nothing**: jobs run as background tasks under their own
+  concurrency cap, so a ten-minute `claude` job never delays a watcher check or
+  freezes the health heartbeat. An engine restart mid-run is recovered on
+  startup instead of leaving the job permanently "running".
 - **Triage handlers**: any watcher or job can carry a `handler_prompt` — the
   engine wakes Claude on the event, and its one-line judgment becomes the
   notification. Every LLM failure degrades to the raw alert tagged

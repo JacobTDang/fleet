@@ -113,6 +113,20 @@ def update_job_state(conn, job_id, **fields):
     conn.commit()
 
 
+def clear_running(conn):
+    """Runs only exist inside the engine process, so a `running` flag that
+    survived a restart marks an interrupted run — not a live one. Left alone it
+    is permanent: every future fire is recorded as skipped_overlap and the job
+    silently never runs again. Returns the jobs it recovered."""
+    rows = [dict(r) for r in conn.execute(
+        "SELECT j.id, j.name FROM jobs j JOIN job_state s ON s.job_id = j.id"
+        " WHERE s.running = 1")]
+    if rows:
+        conn.execute("UPDATE job_state SET running = 0 WHERE running = 1")
+        conn.commit()
+    return rows
+
+
 def record_run(conn, *, job_id=None, watcher_id=None, status, scheduled_for=None,
                started_at=None, finished_at=None, exit_code=None, output=None,
                error=None, attempt=1, llm_tier=None):

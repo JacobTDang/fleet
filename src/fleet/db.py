@@ -313,6 +313,18 @@ def update_state(conn, watcher_id, **fields):
     conn.commit()
 
 
+def consume_push(conn, watcher_id, value):
+    """Clear a webhook value only if it is still the one the engine processed.
+    A push that lands mid-check would otherwise be erased by the clear — the
+    event would vanish with no error anywhere. Returns False when that happened,
+    so the caller leaves the watcher due instead of parking it."""
+    cur = conn.execute(
+        "UPDATE state SET pushed_value = NULL WHERE watcher_id = ? AND pushed_value IS ?",
+        (watcher_id, value))
+    conn.commit()
+    return cur.rowcount > 0
+
+
 def record_check(conn, watcher_id, status, detail=None):
     conn.execute("INSERT INTO checks (watcher_id, status, detail) VALUES (?, ?, ?)",
                  (watcher_id, status, detail))

@@ -99,3 +99,12 @@ def test_recent_runs_newest_first(conn):
     rs = jobs.recent_runs(conn, job_id=j["id"])
     assert [r["status"] for r in rs] == ["fail", "ok"]
     assert rs[0]["name"] == "digest"
+
+
+def test_clear_running_recovers_jobs_interrupted_by_a_restart(conn):
+    j = make(conn)
+    jobs.update_job_state(conn, j["id"], running=1)   # engine died mid-run
+    cleared = jobs.clear_running(conn)
+    assert [c["name"] for c in cleared] == ["digest"]
+    assert jobs.list_jobs(conn)[0]["running"] == 0
+    assert jobs.clear_running(conn) == []             # idempotent
