@@ -168,3 +168,25 @@ def test_prune_checks_removes_only_old_rows(conn):
     deleted = db.prune_checks(conn, keep_days=30)
     assert deleted == 1
     assert conn.execute("SELECT COUNT(*) FROM checks").fetchone()[0] == 1
+
+
+def test_webhook_watcher_gets_secret_and_domain(conn):
+    w = db.create_watcher(conn, name="hook", kind="webhook", target="tradingview")
+    assert w["domain"] == "webhook"
+    assert isinstance(w["webhook_secret"], str) and len(w["webhook_secret"]) >= 20
+
+
+def test_create_watcher_validates_cron(conn):
+    with pytest.raises(ValueError):
+        db.create_watcher(conn, name="bad", kind="script", target="echo hi", cron="nope")
+    w = db.create_watcher(conn, name="mkt", kind="script", target="echo hi", cron="0 9 * * 1-5")
+    assert w["cron"] == "0 9 * * 1-5"
+
+
+def test_connect_ro_cannot_write(tmp_path):
+    path = tmp_path / "ro.db"
+    db.connect(path).close()
+    ro = db.connect_ro(path)
+    with pytest.raises(sqlite3.OperationalError):
+        ro.execute("INSERT INTO audit (source, entity, action) VALUES ('mcp','watcher','x')")
+    ro.close()
