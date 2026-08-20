@@ -1,0 +1,59 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ntfy-data
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ntfy
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: ntfy}
+  template:
+    metadata:
+      labels: {app: ntfy}
+    spec:
+      containers:
+        - name: ntfy
+          image: binwiederhier/ntfy:latest   # pin after first pull
+          args: ["serve"]
+          env:
+            - {name: NTFY_BASE_URL, value: "http://ntfy.YOUR-TAILNET.ts.net"}  # fill in
+            - {name: NTFY_CACHE_FILE, value: /var/lib/ntfy/cache.db}
+            - {name: NTFY_AUTH_FILE, value: /var/lib/ntfy/user.db}
+            - {name: NTFY_AUTH_DEFAULT_ACCESS, value: deny-all}
+            - {name: NTFY_ENABLE_LOGIN, value: "true"}
+          ports: [{containerPort: 80}]
+          volumeMounts: [{name: data, mountPath: /var/lib/ntfy}]
+      volumes:
+        - name: data
+          persistentVolumeClaim: {claimName: ntfy-data}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ntfy            # in-cluster DNS name the worker uses (NTFY_URL)
+spec:
+  selector: {app: ntfy}
+  ports: [{port: 80, targetPort: 80}]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ntfy-ts         # tailnet door for the phone app
+  annotations:
+    tailscale.com/hostname: ntfy
+spec:
+  type: LoadBalancer
+  loadBalancerClass: tailscale
+  selector: {app: ntfy}
+  ports: [{name: http, port: 80, targetPort: 80}]

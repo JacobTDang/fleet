@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fleet-config
+data:
+  FLEET_DB: /data/fleet.db
+  NTFY_URL: http://ntfy
+  NTFY_TOPIC: fleet-alerts
+  FLEET_TZ: America/New_York          # schedules are interpreted here
+  FLEET_TICK_SECONDS: "5"
+  FLEET_FAIL_THRESHOLD: "3"
+  FLEET_DOMAIN_MIN_GAP: "2.0"
+  FLEET_MAX_CONCURRENT: "20"
+  FLEET_JOBS_MAX_CONCURRENT: "5"
+  FLEET_GRACE_SECONDS: "3600"
+  FLEET_DEFER_SECONDS: "3600"
+  FLEET_CLAUDE_MAX_RUNS_PER_DAY: "24"
+  FLEET_HEALTH_PORT: "8686"
+  FLEET_USER_AGENT: fleet-watcher/0.2 (personal monitoring)
+  FLEET_FALLBACK_LLM_URL: https://openrouter.ai/api/v1
+  FLEET_FALLBACK_MODELS: ""           # e.g. deepseek/deepseek-chat:free,qwen/qwen3-235b:free

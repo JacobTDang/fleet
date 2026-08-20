@@ -1,16 +1,18 @@
 # fleet
 
-A private 24/7 watcher server: hundreds of monitors/notifier bots as **rows in
-a database**, run by one engine, alerting a phone via ntfy, managed from Claude
-Code over MCP — reachable only through a Tailscale network.
+A private 24/7 automation server: hundreds of watchers and cron jobs as
+**rows in a database**, run by one engine, alerting a phone via ntfy, judged
+by short-lived headless Claude runs, managed from Claude Code over MCP —
+reachable only through a Tailscale network.
 
 ```
-you (Mac/phone) ──tailscale──▶ fleet box (Oracle A1, free)
-                               ├─ worker          the engine: schedules + runs every watcher
+you (Mac/phone) ──tailscale──▶ fleet box (home-lab laptop: Proxmox VM + k3s)
+                               ├─ worker          the engine: watchers + cron jobs, dashboard,
+                               │                  webhook ingress, /health — one process
                                ├─ mcp             management console (Claude Code connects here)
                                ├─ ntfy            self-hosted push notifications
                                └─ changedetection CSS-selector page-diff watches (own UI)
-                    watchdog box (GCP e2-micro, free, different vendor)
+                    watchdog box (GCP e2-micro, free, different failure domain)
                                └─ curls /health every 5 min; pulls nightly backups;
                                   alerts via ntfy.sh if the fleet box dies
 ```
@@ -34,6 +36,33 @@ Design rules the code enforces:
 | `script` | shell command | — | change of stdout |
 
 CSS-selector page diffing is delegated to the bundled changedetection.io.
+A `webhook` kind receives pushed values (`POST /hook/<name>/<secret>`) instead
+of polling; a `cron` field on any watcher replaces its interval with
+exact-time scheduling ("0 9 * * 1-5").
+
+## Jobs
+
+Cron-scheduled tasks sharing the same engine, DB, and alerting:
+
+| kind | target | runs |
+|---|---|---|
+| `script` | shell command | with retries, timeout, per-attempt history |
+| `claude` | a prompt | headless Claude, budget-gated, tools off by default |
+
+- **notify_policy**: `on_failure` (default) · `always` (output → phone) ·
+  `on_output` (cron etiquette: only when stdout is non-empty) · `never`.
+- **Semantics**: missed fires run late within a 1h grace window (alert+skip
+  beyond it); overlapping fires skip, never stack; DST handled per-job tz.
+- **Triage handlers**: any watcher or job can carry a `handler_prompt` — the
+  engine wakes Claude on the event, and its one-line judgment becomes the
+  notification. Every LLM failure degrades to the raw alert tagged
+  `[unjudged]`; the ladder is subscription → defer (`defer_ok`) → OpenRouter
+  free tier (`fallback_ok`, `FLEET_FALLBACK_MODELS`) → raw. Never silent.
+- **Burst pattern**: a 9:55 job runs `fleetctl set-interval tickets 30`, a
+  noon job relaxes it back — camp aggressively only when it matters.
+- **Three doors, one engine**: MCP tools (write), the read-only dashboard on
+  `:8686` (`/`, `/runs`, `/alerts`, `/audit`), and `fleetctl` over SSH —
+  every mutation from any door lands in the audit trail.
 
 ## Local development
 
@@ -46,23 +75,13 @@ curl -s localhost:8686/health     # worker heartbeat
 
 ## Deploy runbook
 
-1. **Provision** the Oracle A1 (2 OCPU / 12 GB — *not more*, see
-   `deploy/oci-notes.md`), Ubuntu, and lock down inbound per those notes.
-2. On the box: clone this repo, `./deploy/setup.sh` (installs docker +
-   tailscale + unattended-upgrades, binds everything to the tailscale IP,
-   starts the stack, installs the backup cron).
-3. **ntfy auth** (default access is deny-all):
-   `sudo docker compose exec ntfy ntfy user add --role=admin <you>` then
-   `... ntfy token add <you>`; put the token in `.env` as `NTFY_TOKEN`,
-   `sudo docker compose up -d`. Subscribe the ntfy phone app to
-   `http://<tailscale-ip>:8666/fleet-alerts` (phone must be on the tailnet).
-4. **Connect Claude Code** (on the Mac):
-   `claude mcp add --transport http fleet http://<tailscale-name>:8765/mcp`
-   Then manage in plain language: "create a watcher for … every 15 minutes".
-5. **Watchdog**: second box per `deploy/watchdog/README.md` — and actually
-   fire its failure path once.
-6. **Pin images**: after first pull, `sudo docker compose images` and replace
-   the `:latest` tags in docker-compose.yml with the pulled versions.
+Production is **k3s on the home-lab laptop** — the full runbook (k3s install,
+Tailscale operator, ACLs, deploy-day checklist, restore drill) lives in
+`deploy/k8s/README.md`. The compose file above is the local dev harness.
+The cloud-VM compose path (`deploy/setup.sh`, `deploy/oci-notes.md`) remains
+as the fallback deployment target. Either way: the **watchdog** is a second
+box in a different failure domain per `deploy/watchdog/README.md` — set it up
+and actually fire its failure path once.
 
 ## Operating it
 

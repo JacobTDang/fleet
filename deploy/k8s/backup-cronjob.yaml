@@ -1,0 +1,45 @@
+# Nightly WAL-safe sqlite .backup to a hostPath dir the watchdog box rsyncs
+# (point its pull-backup.sh FLEET_REPO at /var/fleet-backups on the VM).
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: fleet-backup
+spec:
+  schedule: "17 3 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: backup
+              image: fleet:latest
+              imagePullPolicy: IfNotPresent
+              command:
+                - python
+                - -c
+                - |
+                  import datetime, glob, os, shutil, sqlite3
+                  src = sqlite3.connect("/data/fleet.db")
+                  day = datetime.date.today().isoformat()
+                  dst = sqlite3.connect(f"/backups/fleet-{day}.db")
+                  src.backup(dst)
+                  dst.close()
+                  import fleet.db as d
+                  n = d.prune_checks(src, keep_days=30)
+                  src.close()
+                  shutil.copy(f"/backups/fleet-{day}.db", "/backups/fleet-latest.db")
+                  for p in sorted(glob.glob("/backups/fleet-2*.db"), reverse=True)[14:]:
+                      os.remove(p)
+                  print(f"backup ok: fleet-{day}.db (pruned {n} old checks)")
+              volumeMounts:
+                - {name: data, mountPath: /data}
+                - {name: backups, mountPath: /backups}
+          volumes:
+            - name: data
+              persistentVolumeClaim: {claimName: fleet-data}
+            - name: backups
+              hostPath: {path: /var/fleet-backups, type: DirectoryOrCreate}

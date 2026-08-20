@@ -1,0 +1,54 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: fleet-data
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fleet-core
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate            # SQLite: never let a rolling update run two writers
+  selector:
+    matchLabels: {app: fleet-core}
+  template:
+    metadata:
+      labels: {app: fleet-core}
+    spec:
+      containers:
+        - name: worker
+          image: fleet:latest
+          imagePullPolicy: IfNotPresent   # imported into containerd, no registry
+          command: ["fleet-worker"]
+          envFrom:
+            - configMapRef: {name: fleet-config}
+            - secretRef: {name: fleet-secrets}
+          ports: [{containerPort: 8686}]
+          volumeMounts: [{name: data, mountPath: /data}]
+          livenessProbe:                  # /health goes 503 when the engine stalls
+            httpGet: {path: /health, port: 8686}
+            initialDelaySeconds: 30
+            periodSeconds: 60
+            failureThreshold: 5
+        - name: mcp
+          image: fleet:latest
+          imagePullPolicy: IfNotPresent
+          command: ["fleet-mcp"]
+          envFrom:
+            - configMapRef: {name: fleet-config}
+            - secretRef: {name: fleet-secrets}
+          env:
+            - {name: FLEET_MCP_HOST, value: "0.0.0.0"}
+          ports: [{containerPort: 8765}]
+          volumeMounts: [{name: data, mountPath: /data}]
+      volumes:
+        - name: data
+          persistentVolumeClaim: {claimName: fleet-data}

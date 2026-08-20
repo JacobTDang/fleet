@@ -1,0 +1,12 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: fleet
+resources:
+  - namespace.yaml
+  - config.yaml
+  - fleet-core.yaml
+  - services.yaml
+  - ntfy.yaml
+  - changedetection.yaml
+  - backup-cronjob.yaml
+# secrets.yaml is applied separately (copy secrets.example.yaml, fill in, never commit)
