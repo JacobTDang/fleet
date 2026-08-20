@@ -104,4 +104,9 @@ async def run_check(watcher, client, *, script_timeout=SCRIPT_TIMEOUT):
         return await _http_check(watcher, client)
     if kind == "script":
         return await _script_check(watcher, script_timeout)
+    if kind == "webhook":
+        pushed = watcher.get("pushed_value")
+        if pushed is None:
+            return CheckResult(ok=True, not_modified=True)
+        return CheckResult(ok=True, value=pushed)
     return CheckResult(ok=False, error=f"unknown kind: {kind}")
