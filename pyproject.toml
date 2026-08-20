@@ -1,6 +1,6 @@
 [project]
 name = "fleet"
-version = "0.4.0"
+version = "0.4.1"
 description = "Private 24/7 watcher fleet: one engine, watchers as rows, alerts via ntfy, managed over MCP"
 requires-python = ">=3.12"
 dependencies = [

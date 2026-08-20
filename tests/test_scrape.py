@@ -142,3 +142,26 @@ async def test_content_path_selects_json_field_or_whole_body(path, expected):
     client = make_client(lambda req: httpx.Response(200, json={"data": {"markdown": "hi"}}))
     r = await run_check(watcher(), client, scrape=cfg)
     assert r.ok and r.value.startswith(expected)
+
+
+@pytest.mark.parametrize("status,blocked", [(404, False), (500, False), (403, True), (429, True)])
+async def test_any_error_status_from_the_target_is_an_error_not_content(status, blocked):
+    # Firecrawl answers success:true even when the page came back 404 or 500 —
+    # the real status is only in data.metadata.statusCode. Extracting from a
+    # 404 body would report "the page changed" and then monitor the error page.
+    client = make_client(lambda req: ok_response("# Not Found\n\nnothing here", status=status))
+    r = await run_check(watcher(), client, scrape=FIRECRAWL)
+    assert not r.ok, f"HTTP {status} content must never become a value"
+    assert str(status) in r.error
+    assert r.blocked is blocked, "only a refusal should back the domain off"
+    assert r.body, "keep the body: it is the evidence of what the site served"
+
+
+async def test_a_failed_extract_keeps_the_page_so_you_can_fix_the_selector():
+    # The most common authoring mistake is an extract written against HTML when
+    # the provider returns markdown. Without the page you are guessing blind.
+    client = make_client(lambda req: ok_response("# Tickets\n\nStatus: AVAILABLE"))
+    r = await run_check(watcher(extract=r'<span class="status">(\w+)'), client,
+                        scrape=FIRECRAWL)
+    assert not r.ok and "regex matched nothing" in r.error
+    assert r.body and "Status: AVAILABLE" in r.body, "keep the content to debug against"

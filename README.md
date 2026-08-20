@@ -87,6 +87,18 @@ announces itself once and then stops spending, and `FLEET_SCRAPE_MAX_CONCURRENT`
 A provider refusing *us* is an error; the *target* refusing (visible in the
 provider's reported status) is what backs the domain off.
 
+**Wiring a self-hosted Firecrawl:** point `FLEET_SCRAPE_URL` at the **raw API**
+(`:3002/v2/scrape`), not at a failure-proxy in front of it. Firecrawl answers
+`success: true` even when the page came back 404 or 500 — the real status is
+only in `data.metadata.statusCode` — and fleet reads that itself, so it can
+tell a refusal (403/429 → back the whole domain off) from a plain 404 (error,
+no backoff). A proxy that flattens both into `success: false` throws that
+distinction away. Note also that extracts run against **markdown**, not HTML;
+when one misses, the page is kept in `watcher_snapshots` so you can write the
+selector against what actually arrived. Compose binds Firecrawl to
+`127.0.0.1`, so reach it as `host.docker.internal` from Docker Desktop, or put
+both stacks on one network when deploying to the laptop.
+
 CSS-selector page diffing is delegated to the bundled changedetection.io.
 **Wire its notifications into fleet** rather than running two alert systems:
 create a `webhook` watcher, then set changedetection's notification URL to
@@ -126,7 +138,7 @@ Cron-scheduled tasks sharing the same engine, DB, and alerting:
 ## Local development
 
 ```bash
-uv sync && uv run pytest          # 192 tests, all offline
+uv sync && uv run pytest          # 197 tests, all offline
 uvx ruff@0.16.3 check .           # same lint CI runs
 ./scripts/smoke.sh                # end-to-end against a live stack, then tears down
 docker compose up -d --build      # or bring the stack up by hand on 127.0.0.1
