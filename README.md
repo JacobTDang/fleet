@@ -60,6 +60,33 @@ earns a ban. `Retry-After` is honored when sent; otherwise backoff doubles from
 The raw body from a refused check is kept (`watcher_snapshots`) so you can see
 what the site actually served.
 
+### Monitoring pages that a plain GET can't read
+
+Set `fetch_via="scrape"` on an `http_text`/`http_json` watcher and the fetch
+goes through a rendering / anti-bot service instead of a direct request, so
+JavaScript-rendered pages and sites that refuse plain clients become
+monitorable. Everything downstream is unchanged — same extraction, same
+guards, same diffing.
+
+The transport is provider-agnostic: any API that accepts JSON containing the
+URL and returns the page works, configured entirely in the environment
+(`FLEET_SCRAPE_URL`, `_KEY`, `_BODY`, `_PATH`). Defaults match Firecrawl v2;
+`FLEET_SCRAPE_PATH=` (empty) suits a renderer that returns raw HTML such as
+browserless. Two details worth knowing:
+
+- **`maxAge: 0` is load-bearing.** Firecrawl serves cached pages by default,
+  and a monitor fed from a cache looks perfectly healthy while never seeing a
+  change again.
+- **Markdown diffs better than HTML.** The default asks for markdown, so class
+  and markup churn stops producing false changes.
+
+Costs are metered accordingly: a 300s interval floor, `FLEET_SCRAPE_MAX_PER_DAY`
+(0 = unlimited, right for self-hosted; set it for a credit-metered cloud) which
+announces itself once and then stops spending, and `FLEET_SCRAPE_MAX_CONCURRENT`
+(default 3) because a browser service melts long before the watcher pool does.
+A provider refusing *us* is an error; the *target* refusing (visible in the
+provider's reported status) is what backs the domain off.
+
 CSS-selector page diffing is delegated to the bundled changedetection.io.
 **Wire its notifications into fleet** rather than running two alert systems:
 create a `webhook` watcher, then set changedetection's notification URL to
@@ -99,7 +126,7 @@ Cron-scheduled tasks sharing the same engine, DB, and alerting:
 ## Local development
 
 ```bash
-uv sync && uv run pytest          # 168 tests, all offline
+uv sync && uv run pytest          # 192 tests, all offline
 uvx ruff@0.16.3 check .           # same lint CI runs
 ./scripts/smoke.sh                # end-to-end against a live stack, then tears down
 docker compose up -d --build      # or bring the stack up by hand on 127.0.0.1

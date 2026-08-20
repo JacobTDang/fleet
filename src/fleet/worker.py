@@ -5,6 +5,7 @@ when it comes back — so silence always means "quiet and healthy", never
 "broken and nobody noticed"."""
 
 import asyncio
+import contextlib
 import difflib
 import hashlib
 import json
@@ -19,7 +20,7 @@ import httpx
 
 from fleet import cron, db
 from fleet import jobs as jobs_db
-from fleet.checkers import run_check
+from fleet.checkers import ScrapeConfig, run_check
 from fleet.jobrunner import FAR_FUTURE, process_job, run_judged
 from fleet.llm import Llm
 from fleet.notify import Notifier, NotifyError
@@ -133,9 +134,24 @@ async def _alert(conn, w, notifier, health, *, title, message, kind, priority="d
 
 async def process_watcher(conn, w, *, client, notifier, gate, rng,
                           fail_threshold=3, now_fn=time.time, health=None,
-                          llm=None, global_budget=24, tz_name="UTC"):
+                          llm=None, global_budget=24, tz_name="UTC",
+                          scrape=None, scrape_budget=0):
+    if (w["fetch_via"] == "scrape" and scrape_budget
+            and db.scrape_checks_today(conn) >= scrape_budget):
+        # Out of rendered fetches for today. Not a site failure — say so once,
+        # do not spend, and do not let it look like the target is broken.
+        db.record_check(conn, w["id"], "error",
+                        detail=f"scrape budget exhausted ({scrape_budget}/day)")
+        if db.count_alerts(conn, w["id"], title_like="scrape budget", within_hours=24) == 0:
+            await _alert(conn, w, notifier, health, title="scrape budget exhausted",
+                         message=f"{scrape_budget} rendered fetches used today;"
+                                 f" scrape-backed watchers are paused until midnight",
+                         kind="error", priority="high")
+        db.update_state(conn, w["id"],
+                        next_run_at=next_run(w["interval_seconds"], now=now_fn(), rng=rng))
+        return
     async with gate.slot(w["domain"]):
-        result = await run_check(w, client)
+        result = await run_check(w, client, scrape=scrape)
     now = now_fn()
     prev_failures = w["consecutive_failures"]
     if w["kind"] == "webhook":
@@ -279,7 +295,8 @@ class JobPool:
 async def tick(conn, *, client, notifier, gate, rng, llm=None, fail_threshold=3,
                max_concurrent=20, jobs_max_concurrent=5, grace_seconds=3600,
                defer_seconds=3600, global_budget=24, tz_name="UTC",
-               now_fn=time.time, health=None, job_pool=None):
+               now_fn=time.time, health=None, job_pool=None,
+               scrape=None, scrape_budget=0, scrape_max_concurrent=3):
     """Check every due watcher, launch every due job. Without a job_pool the
     jobs are drained before returning (single-shot/test use); the daemon passes
     a long-lived pool so ticks never wait on job execution."""
@@ -289,12 +306,19 @@ async def tick(conn, *, client, notifier, gate, rng, llm=None, fail_threshold=3,
     due_jobs = jobs_db.due_jobs(conn, now_fn())
     sem = asyncio.Semaphore(max_concurrent)
 
+    # rendering is far heavier than a GET: a local browser service melts long
+    # before the watcher pool does, so scrape-backed checks get their own limit
+    scrape_sem = asyncio.Semaphore(scrape_max_concurrent)
+
     async def bounded(w):
         async with sem:
-            await process_watcher(conn, w, client=client, notifier=notifier,
-                                  gate=gate, rng=rng, fail_threshold=fail_threshold,
-                                  now_fn=now_fn, health=health, llm=llm,
-                                  global_budget=global_budget, tz_name=tz_name)
+            limiter = scrape_sem if w["fetch_via"] == "scrape" else contextlib.nullcontext()
+            async with limiter:
+                await process_watcher(conn, w, client=client, notifier=notifier,
+                                      gate=gate, rng=rng, fail_threshold=fail_threshold,
+                                      now_fn=now_fn, health=health, llm=llm,
+                                      global_budget=global_budget, tz_name=tz_name,
+                                      scrape=scrape, scrape_budget=scrape_budget)
 
     for j in due_jobs:
         if not j["running"]:
@@ -352,6 +376,11 @@ async def _main():
     defer_seconds = float(os.environ.get("FLEET_DEFER_SECONDS", "3600"))
     global_budget = int(os.environ.get("FLEET_CLAUDE_MAX_RUNS_PER_DAY", "24"))
     tz_name = os.environ.get("FLEET_TZ", "UTC")
+    scrape = ScrapeConfig.from_env()
+    scrape_budget = int(os.environ.get("FLEET_SCRAPE_MAX_PER_DAY", "0"))
+    scrape_max_concurrent = int(os.environ.get("FLEET_SCRAPE_MAX_CONCURRENT", "3"))
+    if scrape:
+        print(f"[fleet] scrape transport: {scrape.url}", flush=True)
     job_pool = JobPool(jobs_max_concurrent)
     print(f"[fleet] worker up: db={os.environ['FLEET_DB']} tick={tick_seconds}s", flush=True)
     while True:
@@ -361,7 +390,8 @@ async def _main():
                        jobs_max_concurrent=jobs_max_concurrent,
                        grace_seconds=grace_seconds, defer_seconds=defer_seconds,
                        global_budget=global_budget, tz_name=tz_name, health=health,
-                       job_pool=job_pool)
+                       job_pool=job_pool, scrape=scrape, scrape_budget=scrape_budget,
+                       scrape_max_concurrent=scrape_max_concurrent)
         if n:
             print(f"[fleet] tick: {n} item(s) due", flush=True)
         await asyncio.sleep(tick_seconds)

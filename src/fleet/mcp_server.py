@@ -38,7 +38,7 @@ def watcher_create(name: str, kind: str, target: str, extract: str | None = None
                    fallback_ok: bool = True, expect_pattern: str | None = None,
                    headers: str | None = None, min_change_pct: float | None = None,
                    timeout_seconds: int | None = None,
-                   alert_max_per_hour: int = 0) -> dict:
+                   alert_max_per_hour: int = 0, fetch_via: str = "direct") -> dict:
     """Create a watcher. kind: http_json (extract=dot.path), http_text
     (extract=regex, first group), script (target=shell command, stdout is the
     value), or webhook (value is POSTed to /hook/<name>/<secret>; the secret
@@ -52,7 +52,14 @@ def watcher_create(name: str, kind: str, target: str, extract: str | None = None
     headers (JSON object; use "${ENV_VAR}" for API keys so secrets stay out of
     the database); min_change_pct (numeric values only alert on a move this
     large, measured from the last alerted value); timeout_seconds;
-    alert_max_per_hour (0 = uncapped; the cap announces itself once)."""
+    alert_max_per_hour (0 = uncapped; the cap announces itself once).
+
+    fetch_via="scrape" routes the fetch through the configured rendering /
+    anti-bot service (FLEET_SCRAPE_URL) instead of a plain GET — use it for
+    JavaScript-rendered pages and sites that refuse a direct request. It
+    returns markdown by default, which is far more stable to diff than raw
+    HTML, and carries a 300s interval floor because each fetch costs a credit
+    or a browser."""
     with _conn() as conn:
         w = db.create_watcher(conn, name=name, kind=kind, target=target,
                               extract=extract, interval_seconds=interval_seconds,
@@ -61,7 +68,8 @@ def watcher_create(name: str, kind: str, target: str, extract: str | None = None
                               expect_pattern=expect_pattern, headers=headers,
                               min_change_pct=min_change_pct,
                               timeout_seconds=timeout_seconds,
-                              alert_max_per_hour=alert_max_per_hour)
+                              alert_max_per_hour=alert_max_per_hour,
+                              fetch_via=fetch_via)
         db.record_audit(conn, source="mcp", entity="watcher", entity_id=w["id"],
                         action="create", detail={"kind": kind, "target": target})
         return w
@@ -79,7 +87,8 @@ def watcher_update(ident: int | str, name: str | None = None, target: str | None
                    handler_prompt: str | None = None, expect_pattern: str | None = None,
                    headers: str | None = None, min_change_pct: float | None = None,
                    timeout_seconds: int | None = None,
-                   alert_max_per_hour: int | None = None) -> dict:
+                   alert_max_per_hour: int | None = None,
+                   fetch_via: str | None = None) -> dict:
     """Update a watcher (by id or name). Only provided fields change."""
     fields = {k: v for k, v in dict(name=name, target=target, extract=extract,
                                     interval_seconds=interval_seconds,
@@ -88,7 +97,8 @@ def watcher_update(ident: int | str, name: str | None = None, target: str | None
                                     expect_pattern=expect_pattern, headers=headers,
                                     min_change_pct=min_change_pct,
                                     timeout_seconds=timeout_seconds,
-                                    alert_max_per_hour=alert_max_per_hour
+                                    alert_max_per_hour=alert_max_per_hour,
+                                    fetch_via=fetch_via
                                     ).items() if v is not None}
     with _conn() as conn:
         w = _resolve(conn, ident)

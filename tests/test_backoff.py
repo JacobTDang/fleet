@@ -44,3 +44,30 @@ def test_retry_after_header_is_honoured_over_the_default(conn):
     until = db.set_domain_backoff(conn, "shop.com", until=NOW + 3600, reason="Retry-After")
     assert until == NOW + 3600
     assert db.domain_backoff(conn, "shop.com")["until"] == NOW + 3600
+
+
+def test_scrape_watchers_get_a_higher_interval_floor(conn):
+    # A rendered fetch is expensive (credits on a cloud provider, a browser on a
+    # self-hosted one); 30s polling would be ruinous either way.
+    with pytest.raises(ValueError):
+        db.create_watcher(conn, name="spa", kind="http_text", target="https://spa.example",
+                          fetch_via="scrape", interval_seconds=60)
+    w = db.create_watcher(conn, name="spa", kind="http_text", target="https://spa.example",
+                          fetch_via="scrape", interval_seconds=300)
+    assert w["fetch_via"] == "scrape"
+
+
+def test_fetch_via_must_be_known(conn):
+    with pytest.raises(ValueError):
+        db.create_watcher(conn, name="x", kind="http_text", target="https://a.com",
+                          fetch_via="telepathy")
+
+
+def test_scrape_usage_is_counted_for_the_daily_budget(conn):
+    w = db.create_watcher(conn, name="spa", kind="http_text", target="https://spa.example",
+                          fetch_via="scrape", interval_seconds=300)
+    d = db.create_watcher(conn, name="plain", kind="http_text", target="https://a.com")
+    db.record_check(conn, w["id"], "ok")
+    db.record_check(conn, w["id"], "changed")
+    db.record_check(conn, d["id"], "ok")
+    assert db.scrape_checks_today(conn) == 2, "only scrape-backed checks cost anything"
