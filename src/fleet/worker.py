@@ -193,7 +193,9 @@ async def tick(conn, *, client, notifier, gate, rng, llm=None, fail_threshold=3,
 async def _main():
     tick_seconds = float(os.environ.get("FLEET_TICK_SECONDS", "5"))
     health = Health(tick_seconds=tick_seconds)
-    start_health_server(health, port=int(os.environ.get("FLEET_HEALTH_PORT", "8686")))
+    from fleet.webui import start_web_server  # deferred: webui imports jobrunner
+    start_web_server(health, os.environ["FLEET_DB"],
+                     port=int(os.environ.get("FLEET_HEALTH_PORT", "8686")))
     conn = db.connect(os.environ["FLEET_DB"])
     client = httpx.AsyncClient(
         timeout=30.0,
