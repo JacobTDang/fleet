@@ -5,6 +5,7 @@ when it comes back — so silence always means "quiet and healthy", never
 "broken and nobody noticed"."""
 
 import asyncio
+import difflib
 import hashlib
 import json
 import os
@@ -23,6 +24,41 @@ from fleet.jobrunner import FAR_FUTURE, process_job, run_judged
 from fleet.llm import Llm
 from fleet.notify import Notifier, NotifyError
 from fleet.scheduler import DomainGate, next_run
+
+
+def _numeric(value):
+    try:
+        return float(str(value).strip().replace(",", ""))
+    except (TypeError, ValueError):
+        return None
+
+
+def _below_threshold(w, anchor, new_value):
+    """True when a numeric move is too small to be worth waking someone for.
+    The threshold anchors on the last value that was ALERTED, never on the last
+    value seen — anchoring on the latter lets a 0.4%-per-check drift travel any
+    distance without ever crossing a 2% threshold."""
+    pct = w.get("min_change_pct")
+    if not pct:
+        return False
+    old, new = _numeric(anchor), _numeric(new_value)
+    if old is None or new is None or old == 0:
+        return False          # a threshold must never mute a non-numeric change
+    return abs(new - old) / abs(old) * 100.0 < pct
+
+
+def _change_message(old, new, limit=1200):
+    """A unified diff when the value is a page, "old -> new" when it is a price.
+    Truncating a 40 KB page to 200 characters tells you nothing about what
+    actually changed."""
+    old, new = old or "", new or ""
+    if "\n" in old or "\n" in new or len(old) + len(new) > 200:
+        diff = list(difflib.unified_diff(old.splitlines(), new.splitlines(),
+                                         fromfile="before", tofile="after",
+                                         lineterm="", n=1))
+        if diff:
+            return "\n".join(diff[:40])[:limit]
+    return f"{_trunc(old)} -> {_trunc(new)}"
 
 
 def _trunc(s, n=200):
@@ -114,7 +150,8 @@ async def process_watcher(conn, w, *, client, notifier, gate, rng,
 
     if result.ok:
         if result.not_modified:
-            db.record_check(conn, w["id"], "ok", detail="not modified (304)")
+            db.record_check(conn, w["id"], "ok", detail="not modified (304)",
+                            duration_ms=result.duration_ms)
             state["etag"] = result.etag or w["etag"]
             state["last_modified"] = result.last_modified or w["last_modified"]
         else:
@@ -122,28 +159,53 @@ async def process_watcher(conn, w, *, client, notifier, gate, rng,
             state["etag"] = result.etag
             state["last_modified"] = result.last_modified
             if w["last_hash"] is None:
-                db.record_check(conn, w["id"], "ok", detail="baseline")
-                state.update(last_value=result.value, last_hash=new_hash)
-            elif new_hash != w["last_hash"]:
-                detail = f"{_trunc(w['last_value'])} -> {_trunc(result.value)}"
-                db.record_check(conn, w["id"], "changed", detail=detail)
-                message = detail
-                if w.get("handler_prompt"):
-                    context = (f"Watcher {w['name']} changed.\n"
-                               f"Old: {_trunc(w['last_value'], 1000)}\n"
-                               f"New: {_trunc(result.value, 1000)}")
-                    message = await run_judged(
-                        conn, llm, handler_prompt=w["handler_prompt"], context=context,
-                        raw_message=detail, fallback_ok=bool(w["fallback_ok"]),
-                        allow_fleetctl=bool(w["handler_allow_fleetctl"]),
-                        watcher_id=w["id"], global_budget=global_budget)
-                await _alert(conn, w, notifier, health,
-                             title=w["notify_title"] or f"{w['name']} changed",
-                             message=message, kind="change")
+                db.record_check(conn, w["id"], "ok", detail="baseline",
+                                duration_ms=result.duration_ms)
+                # anchor the threshold at the first reading: without a fixed
+                # starting point it would drift with the value and never trip
                 state.update(last_value=result.value, last_hash=new_hash,
-                             last_changed_at=str(now))
+                             alert_anchor=result.value)
+            elif new_hash != w["last_hash"]:
+                anchor = w["alert_anchor"] or w["last_value"]
+                detail = _change_message(w["last_value"], result.value)
+                state.update(last_value=result.value, last_hash=new_hash)
+                cap = w["alert_max_per_hour"] or 0
+                if _below_threshold(w, anchor, result.value):
+                    db.record_check(conn, w["id"], "ok", duration_ms=result.duration_ms,
+                                    detail=f"below {w['min_change_pct']}% threshold: {detail}")
+                elif cap and db.count_alerts(conn, w["id"], kind="change") >= cap:
+                    db.record_check(conn, w["id"], "changed", duration_ms=result.duration_ms,
+                                    detail=f"{detail} (alert suppressed: {cap}/hour cap)")
+                    if db.count_alerts(conn, w["id"], title_like="suppressed") == 0:
+                        # silence must never be ambiguous: say it once, then hold
+                        await _alert(conn, w, notifier, health,
+                                     title=f"{w['name']} alerts suppressed",
+                                     message=f"more than {cap} changes in an hour;"
+                                             f" further change alerts held for an hour",
+                                     kind="error", priority="high")
+                    state["last_changed_at"] = str(now)
+                else:
+                    db.record_check(conn, w["id"], "changed", detail=detail,
+                                    duration_ms=result.duration_ms)
+                    message = detail
+                    if w["handler_prompt"]:
+                        context = (f"Watcher {w['name']} changed.\n"
+                                   f"Old: {_trunc(w['last_value'], 1000)}\n"
+                                   f"New: {_trunc(result.value, 1000)}")
+                        message = await run_judged(
+                            conn, llm, handler_prompt=w["handler_prompt"], context=context,
+                            raw_message=detail, fallback_ok=bool(w["fallback_ok"]),
+                            allow_fleetctl=bool(w["handler_allow_fleetctl"]),
+                            watcher_id=w["id"], global_budget=global_budget)
+                    await _alert(conn, w, notifier, health,
+                                 title=w["notify_title"] or f"{w['name']} changed",
+                                 message=message, kind="change")
+                    # the anchor is "the value you last saw on your phone"
+                    state.update(last_changed_at=str(now), alert_anchor=result.value)
             else:
-                db.record_check(conn, w["id"], "ok")
+                db.record_check(conn, w["id"], "ok", duration_ms=result.duration_ms)
+        if db.domain_backoff(conn, w["domain"]) is not None:
+            db.clear_domain_backoff(conn, w["domain"])
         if prev_failures >= fail_threshold:
             await _alert(conn, w, notifier, health,
                          title=f"{w['name']} recovered",
@@ -152,8 +214,28 @@ async def process_watcher(conn, w, *, client, notifier, gate, rng,
         state["consecutive_failures"] = 0
     else:
         failures = prev_failures + 1
-        db.record_check(conn, w["id"], "error", detail=result.error)
-        if failures == fail_threshold:
+        db.record_check(conn, w["id"], "error", detail=result.error,
+                        duration_ms=result.duration_ms)
+        if result.body:
+            # keep whatever the site actually served on any check we cannot explain
+            db.add_snapshot(conn, w["id"], result.body)
+        if result.blocked:
+            if db.domain_backoff(conn, w["domain"]) is None:
+                # back off the DOMAIN: every watcher on it shares one egress IP,
+                # and a soft rate-limit answered by more knocking becomes a ban.
+                if result.retry_after:
+                    until = db.set_domain_backoff(conn, w["domain"],
+                                                  until=now + result.retry_after,
+                                                  reason=result.error)
+                else:
+                    until = db.bump_domain_backoff(conn, w["domain"], now=now,
+                                                   reason=result.error)
+                await _alert(conn, w, notifier, health,
+                             title=f"{w['domain']} refusing requests",
+                             message=f"{w['name']}: {result.error} — pausing all"
+                                     f" {w['domain']} watchers for {int(until - now)}s",
+                             kind="error", priority="high")
+        elif failures == fail_threshold:
             await _alert(conn, w, notifier, health,
                          title=f"{w['name']} failing",
                          message=f"{failures} consecutive failures: {_trunc(result.error)}",

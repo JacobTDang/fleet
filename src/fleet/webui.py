@@ -82,6 +82,13 @@ def render_index(conn, now):
         jrows.append((_esc(j["name"]), j["kind"], st,
                       "paused" if not j["enabled"] else _eta(j["next_run_at"], now),
                       f"<small>{_esc(j['schedule'])} {_esc(j['tz'])}</small>"))
+    backoffs = db.active_backoffs(conn, now)
+    if backoffs:
+        rows = "".join(
+            f"<li><b>{_esc(b['domain'])}</b> paused for "
+            f"{int(b['backoff_until'] - now)}s — {_esc(b['reason'])}</li>"
+            for b in backoffs)
+        head += f"<p class='bad'>backing off:</p><ul class='bad'>{rows}</ul>"
     body = (head + "<h2>watchers</h2>"
             + _table(("name", "kind", "status", "next", "schedule"), wrows)
             + "<h2>jobs</h2>"

@@ -127,3 +127,43 @@ def test_watcher_create_accepts_v2_params_and_audits(fleet_db):
     conn = db.connect(fleet_db)
     assert len([a for a in db.recent_audit(conn) if a["action"] == "create"]) == 2
     conn.close()
+
+
+def test_watcher_create_accepts_robustness_guards(fleet_db):
+    w = m.watcher_create(name="shop", kind="http_text", target="https://shop.com/p",
+                         extract=r"\$(\d+\.\d+)", expect_pattern="Add to cart",
+                         headers='{"Accept": "text/html"}', min_change_pct=2.0,
+                         timeout_seconds=15, alert_max_per_hour=6)
+    assert w["expect_pattern"] == "Add to cart" and w["min_change_pct"] == 2.0
+    assert w["timeout_seconds"] == 15 and w["alert_max_per_hour"] == 6
+
+
+def test_bad_guards_are_rejected_at_create_time(fleet_db):
+    with pytest.raises(ValueError):
+        m.watcher_create(name="a", kind="http_text", target="https://a.com",
+                         expect_pattern="(unclosed")
+    with pytest.raises(ValueError):
+        m.watcher_create(name="b", kind="http_text", target="https://a.com",
+                         headers="not json")
+    with pytest.raises(ValueError):
+        m.watcher_create(name="c", kind="http_text", target="https://a.com",
+                         min_change_pct=-1)
+
+
+def test_headers_are_hidden_from_listings(fleet_db):
+    m.watcher_create(name="api", kind="http_json", target="https://api.com/v1",
+                     headers='{"Authorization": "Bearer ${MY_KEY}"}')
+    listed = m.watcher_list()[0]
+    assert "Bearer" not in str(listed["headers"]) and "header(s)" in listed["headers"]
+
+
+def test_domain_status_and_snapshots_tools(fleet_db):
+    import time as _t
+    m.watcher_create(name="s", kind="http_text", target="https://shop.com/x")
+    assert m.domain_status() == []
+    conn = db.connect(fleet_db)
+    db.set_domain_backoff(conn, "shop.com", until=_t.time() + 600, reason="HTTP 429")
+    db.add_snapshot(conn, 1, "<h1>Checking your browser</h1>")
+    conn.close()
+    assert m.domain_status()[0]["domain"] == "shop.com"
+    assert "Checking your browser" in m.watcher_snapshots("s")[0]["body"]

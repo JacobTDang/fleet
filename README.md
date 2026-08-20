@@ -34,11 +34,39 @@ Design rules the code enforces:
 | `http_json` | URL | dot path (`items.0.price`) | change of extracted value |
 | `http_text` | URL | regex (first group) | change of match |
 | `script` | shell command | — | change of stdout |
+| `webhook` | pushed to `/hook/<name>/<secret>` | dot path | change of pushed value |
+
+A `cron` field on any watcher replaces its interval with exact-time scheduling
+(`0 9 * * 1-5`).
+
+### Robustness guards (web monitoring)
+
+The two ways a web watcher lies to you are alerting on noise and reporting a
+block page as a change. Each guard is optional and off by default:
+
+| guard | what it does |
+|---|---|
+| `expect_pattern` | regex the page **must** contain, or the check is an error — a bot wall, soft 404, or login redirect can't masquerade as a change |
+| `min_change_pct` | numeric values alert only on a move this large, measured **from the last alerted value** so slow drift still trips it |
+| `alert_max_per_hour` | caps change alerts; announces the cap once, then holds — a flapping watcher can't train you to ignore ntfy |
+| `headers` | JSON object; write API keys as `"${ENV_VAR}"` so the secret lives in the environment, never the database or its backups (listings hide header values) |
+| `timeout_seconds` | per-watcher, for sites that are slow on purpose |
+
+**Domain backoff is automatic and not optional.** A 429/403 (or a failed
+`expect_pattern`) pauses *every watcher on that domain* — they all share one
+egress IP, and answering a soft rate-limit with more requests is how a home IP
+earns a ban. `Retry-After` is honored when sent; otherwise backoff doubles from
+15 minutes up to 6 hours, and one alert names the domain. A success clears it.
+The raw body from a refused check is kept (`watcher_snapshots`) so you can see
+what the site actually served.
 
 CSS-selector page diffing is delegated to the bundled changedetection.io.
-A `webhook` kind receives pushed values (`POST /hook/<name>/<secret>`) instead
-of polling; a `cron` field on any watcher replaces its interval with
-exact-time scheduling ("0 9 * * 1-5").
+**Wire its notifications into fleet** rather than running two alert systems:
+create a `webhook` watcher, then set changedetection's notification URL to
+`json://worker:8686/hook/<watcher-name>/<secret>`. Leave `extract` unset at
+first, look at the value fleet captured, then set a dot-path to the field you
+want. Browser-rendered watches then inherit fleet's escalation, handlers,
+audit, and phone alerts.
 
 ## Jobs
 
@@ -71,7 +99,7 @@ Cron-scheduled tasks sharing the same engine, DB, and alerting:
 ## Local development
 
 ```bash
-uv sync && uv run pytest          # 143 tests, all offline
+uv sync && uv run pytest          # 168 tests, all offline
 uvx ruff@0.16.3 check .           # same lint CI runs
 ./scripts/smoke.sh                # end-to-end against a live stack, then tears down
 docker compose up -d --build      # or bring the stack up by hand on 127.0.0.1

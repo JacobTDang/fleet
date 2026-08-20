@@ -1,6 +1,7 @@
 """SQLite layer: watchers are rows; one engine schedules them all."""
 
 import json
+import re
 import secrets as _secrets
 import sqlite3
 from urllib.parse import urlsplit
@@ -9,7 +10,9 @@ from fleet import cron as cron_mod
 
 KINDS = ("http_json", "http_text", "script", "webhook")
 MIN_INTERVAL = 30
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+BASE_BACKOFF = 900.0      # 15 min after the first refusal
+MAX_BACKOFF = 6 * 3600.0  # never sit on a domain longer than 6h
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS watchers (
@@ -27,6 +30,11 @@ CREATE TABLE IF NOT EXISTS watchers (
   handler_allow_fleetctl INTEGER NOT NULL DEFAULT 0,
   fallback_ok INTEGER NOT NULL DEFAULT 1,
   webhook_secret TEXT,
+  expect_pattern TEXT,
+  min_change_pct REAL,
+  headers TEXT,
+  timeout_seconds INTEGER,
+  alert_max_per_hour INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE TABLE IF NOT EXISTS state (
@@ -38,14 +46,16 @@ CREATE TABLE IF NOT EXISTS state (
   last_changed_at TEXT,
   consecutive_failures INTEGER NOT NULL DEFAULT 0,
   next_run_at REAL NOT NULL DEFAULT 0,
-  pushed_value TEXT
+  pushed_value TEXT,
+  alert_anchor TEXT
 );
 CREATE TABLE IF NOT EXISTS checks (
   id INTEGER PRIMARY KEY,
   watcher_id INTEGER NOT NULL REFERENCES watchers(id) ON DELETE CASCADE,
   ts TEXT NOT NULL DEFAULT (datetime('now')),
   status TEXT NOT NULL CHECK (status IN ('ok','changed','error')),
-  detail TEXT
+  detail TEXT,
+  duration_ms INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_checks_watcher_ts ON checks(watcher_id, ts);
 CREATE TABLE IF NOT EXISTS alerts (
@@ -104,6 +114,20 @@ CREATE TABLE IF NOT EXISTS runs (
   CHECK ((job_id IS NULL) != (watcher_id IS NULL))
 );
 CREATE INDEX IF NOT EXISTS idx_runs_job_ts ON runs(job_id, ts);
+CREATE TABLE IF NOT EXISTS domains (
+  domain TEXT PRIMARY KEY,
+  backoff_until REAL NOT NULL DEFAULT 0,
+  strikes INTEGER NOT NULL DEFAULT 0,
+  reason TEXT,
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS snapshots (
+  id INTEGER PRIMARY KEY,
+  watcher_id INTEGER NOT NULL REFERENCES watchers(id) ON DELETE CASCADE,
+  ts TEXT NOT NULL DEFAULT (datetime('now')),
+  body TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_snapshots_watcher ON snapshots(watcher_id, id);
 CREATE TABLE IF NOT EXISTS audit (
   id INTEGER PRIMARY KEY,
   ts TEXT NOT NULL DEFAULT (datetime('now')),
@@ -118,9 +142,12 @@ CREATE TABLE IF NOT EXISTS audit (
 _STATE_FIELDS = {
     "last_value", "last_hash", "etag", "last_modified",
     "last_changed_at", "consecutive_failures", "next_run_at", "pushed_value",
+    "alert_anchor",
 }
 _WATCHER_FIELDS = {"name", "target", "extract", "interval_seconds", "notify_title", "kind",
-                   "cron", "handler_prompt", "handler_allow_fleetctl", "fallback_ok"}
+                   "cron", "handler_prompt", "handler_allow_fleetctl", "fallback_ok",
+                   "expect_pattern", "min_change_pct", "headers", "timeout_seconds",
+                   "alert_max_per_hour"}
 
 
 def connect(path):
@@ -144,6 +171,23 @@ def connect_ro(path):
     return conn
 
 
+_V3_COLUMNS = {
+    "watchers": [("expect_pattern", "TEXT"), ("min_change_pct", "REAL"),
+                 ("headers", "TEXT"), ("timeout_seconds", "INTEGER"),
+                 ("alert_max_per_hour", "INTEGER NOT NULL DEFAULT 0")],
+    "state": [("alert_anchor", "TEXT")],
+    "checks": [("duration_ms", "INTEGER")],
+}
+
+
+def _add_missing_columns(conn):
+    for table, cols in _V3_COLUMNS.items():
+        have = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+        for name, decl in cols:
+            if name not in have:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+
+
 def _migrate(conn):
     v = conn.execute("PRAGMA user_version").fetchone()[0]
     if v >= SCHEMA_VERSION:
@@ -154,6 +198,7 @@ def _migrate(conn):
         cols = {r[1] for r in conn.execute("PRAGMA table_info(watchers)")}
         if "cron" not in cols:
             _migrate_v1_to_v2(conn)
+        _add_missing_columns(conn)
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.commit()
 
@@ -215,24 +260,54 @@ def _domain_for(kind, target):
     return netloc
 
 
+def _validate_guards(expect_pattern=None, headers=None, min_change_pct=None,
+                     timeout_seconds=None, alert_max_per_hour=None):
+    """Reject bad guards at create time. A regex that never compiles or headers
+    that are not JSON would otherwise fail on every check, forever."""
+    if expect_pattern is not None:
+        try:
+            re.compile(expect_pattern)
+        except re.error as e:
+            raise ValueError(f"expect_pattern is not a valid regex: {e}") from e
+    if headers is not None:
+        try:
+            parsed = json.loads(headers)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"headers must be a JSON object: {e}") from e
+        if not isinstance(parsed, dict):
+            raise ValueError("headers must be a JSON object")
+    if min_change_pct is not None and min_change_pct < 0:
+        raise ValueError("min_change_pct must be >= 0")
+    if timeout_seconds is not None and timeout_seconds <= 0:
+        raise ValueError("timeout_seconds must be > 0")
+    if alert_max_per_hour is not None and alert_max_per_hour < 0:
+        raise ValueError("alert_max_per_hour must be >= 0 (0 = no cap)")
+
+
 def create_watcher(conn, *, name, kind, target, extract=None,
                    interval_seconds=300, notify_title=None, cron=None,
-                   handler_prompt=None, handler_allow_fleetctl=False, fallback_ok=True):
+                   handler_prompt=None, handler_allow_fleetctl=False, fallback_ok=True,
+                   expect_pattern=None, headers=None, min_change_pct=None,
+                   timeout_seconds=None, alert_max_per_hour=0):
     if kind not in KINDS:
         raise ValueError(f"kind must be one of {KINDS}, got: {kind!r}")
     if interval_seconds < MIN_INTERVAL:
         raise ValueError(f"interval_seconds must be >= {MIN_INTERVAL} (politeness floor)")
     if cron is not None:
         cron_mod.validate(cron)
+    _validate_guards(expect_pattern, headers, min_change_pct, timeout_seconds,
+                     alert_max_per_hour)
     domain = _domain_for(kind, target)
     webhook_secret = _secrets.token_urlsafe(24) if kind == "webhook" else None
     cur = conn.execute(
         "INSERT INTO watchers (name, kind, target, extract, interval_seconds, domain,"
         " notify_title, cron, handler_prompt, handler_allow_fleetctl, fallback_ok,"
-        " webhook_secret) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        " webhook_secret, expect_pattern, headers, min_change_pct, timeout_seconds,"
+        " alert_max_per_hour) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (name, kind, target, extract, interval_seconds, domain, notify_title, cron,
          handler_prompt, 1 if handler_allow_fleetctl else 0, 1 if fallback_ok else 0,
-         webhook_secret),
+         webhook_secret, expect_pattern, headers, min_change_pct, timeout_seconds,
+         alert_max_per_hour or 0),
     )
     conn.execute("INSERT INTO state (watcher_id) VALUES (?)", (cur.lastrowid,))
     conn.commit()
@@ -252,7 +327,14 @@ def list_watchers(conn, enabled=None):
     if enabled is not None:
         q += " WHERE w.enabled = ?"
         args = (1 if enabled else 0,)
-    return [dict(r) for r in conn.execute(q + " ORDER BY w.id", args)]
+    rows = []
+    for r in conn.execute(q + " ORDER BY w.id", args):
+        row = dict(r)
+        if row.get("headers"):
+            n = len(json.loads(row["headers"]))
+            row["headers"] = f"({n} header(s) set — hidden)"
+        rows.append(row)
+    return rows
 
 
 def update_watcher(conn, watcher_id, **fields):
@@ -263,6 +345,9 @@ def update_watcher(conn, watcher_id, **fields):
         raise ValueError(f"interval_seconds must be >= {MIN_INTERVAL} (politeness floor)")
     if fields.get("cron") is not None:
         cron_mod.validate(fields["cron"])
+    _validate_guards(fields.get("expect_pattern"), fields.get("headers"),
+                     fields.get("min_change_pct"), fields.get("timeout_seconds"),
+                     fields.get("alert_max_per_hour"))
     current = get_watcher(conn, watcher_id)
     if current is None:
         raise ValueError(f"no watcher with id {watcher_id}")
@@ -290,10 +375,13 @@ def delete_watcher(conn, watcher_id):
 def due_watchers(conn, now):
     rows = conn.execute(
         "SELECT w.*, s.last_value, s.last_hash, s.etag, s.last_modified,"
-        " s.last_changed_at, s.consecutive_failures, s.next_run_at, s.pushed_value"
+        " s.last_changed_at, s.consecutive_failures, s.next_run_at, s.pushed_value,"
+        " s.alert_anchor"
         " FROM watchers w JOIN state s ON s.watcher_id = w.id"
-        " WHERE w.enabled = 1 AND s.next_run_at <= ? ORDER BY s.next_run_at",
-        (now,),
+        " LEFT JOIN domains d ON d.domain = w.domain"
+        " WHERE w.enabled = 1 AND s.next_run_at <= ?"
+        " AND COALESCE(d.backoff_until, 0) <= ? ORDER BY s.next_run_at",
+        (now, now),
     )
     return [dict(r) for r in rows]
 
@@ -313,6 +401,49 @@ def update_state(conn, watcher_id, **fields):
     conn.commit()
 
 
+def domain_backoff(conn, domain):
+    """The live backoff for a domain, or None. Backoff is per-domain because
+    every watcher on a site shares one egress IP: throttling one watcher while
+    nine others keep knocking is how a soft rate-limit becomes a hard ban."""
+    row = conn.execute("SELECT * FROM domains WHERE domain = ?", (domain,)).fetchone()
+    if row is None or row["backoff_until"] <= 0:
+        return None
+    return {"until": row["backoff_until"], "strikes": row["strikes"], "reason": row["reason"]}
+
+
+def active_backoffs(conn, now):
+    rows = conn.execute("SELECT * FROM domains WHERE backoff_until > ?"
+                        " ORDER BY backoff_until DESC", (now,))
+    return [dict(r) for r in rows]
+
+
+def set_domain_backoff(conn, domain, *, until, reason):
+    conn.execute(
+        "INSERT INTO domains (domain, backoff_until, strikes, reason, updated_at)"
+        " VALUES (?, ?, 1, ?, datetime('now'))"
+        " ON CONFLICT(domain) DO UPDATE SET backoff_until = excluded.backoff_until,"
+        " strikes = domains.strikes + 1, reason = excluded.reason,"
+        " updated_at = datetime('now')",
+        (domain, until, reason))
+    conn.commit()
+    return until
+
+
+def bump_domain_backoff(conn, domain, *, now, reason):
+    """Exponential per-domain backoff: a site that keeps refusing is left alone
+    for longer each time, up to MAX_BACKOFF."""
+    row = conn.execute("SELECT strikes FROM domains WHERE domain = ?", (domain,)).fetchone()
+    strikes = (row["strikes"] if row else 0) + 1
+    delay = min(BASE_BACKOFF * (2 ** (strikes - 1)), MAX_BACKOFF)
+    return set_domain_backoff(conn, domain, until=now + delay, reason=reason)
+
+
+def clear_domain_backoff(conn, domain):
+    conn.execute("UPDATE domains SET backoff_until = 0, strikes = 0,"
+                 " updated_at = datetime('now') WHERE domain = ?", (domain,))
+    conn.commit()
+
+
 def consume_push(conn, watcher_id, value):
     """Clear a webhook value only if it is still the one the engine processed.
     A push that lands mid-check would otherwise be erased by the clear — the
@@ -325,10 +456,45 @@ def consume_push(conn, watcher_id, value):
     return cur.rowcount > 0
 
 
-def record_check(conn, watcher_id, status, detail=None):
-    conn.execute("INSERT INTO checks (watcher_id, status, detail) VALUES (?, ?, ?)",
-                 (watcher_id, status, detail))
+def record_check(conn, watcher_id, status, detail=None, duration_ms=None):
+    conn.execute("INSERT INTO checks (watcher_id, status, detail, duration_ms)"
+                 " VALUES (?, ?, ?, ?)", (watcher_id, status, detail, duration_ms))
     conn.commit()
+
+
+SNAPSHOT_MAX_BYTES = 64_000
+SNAPSHOT_KEEP = 3
+
+
+def add_snapshot(conn, watcher_id, body, keep=SNAPSHOT_KEEP):
+    """Keep the raw body from the checks you cannot explain (a block page, a
+    guard failure). Without it, diagnosing "why did my selector break" is
+    guesswork against a page that has since changed again."""
+    conn.execute("INSERT INTO snapshots (watcher_id, body) VALUES (?, ?)",
+                 (watcher_id, (body or "")[:SNAPSHOT_MAX_BYTES]))
+    conn.execute("DELETE FROM snapshots WHERE watcher_id = ? AND id NOT IN"
+                 " (SELECT id FROM snapshots WHERE watcher_id = ?"
+                 "  ORDER BY id DESC LIMIT ?)", (watcher_id, watcher_id, keep))
+    conn.commit()
+
+
+def recent_snapshots(conn, watcher_id, limit=SNAPSHOT_KEEP):
+    rows = conn.execute("SELECT * FROM snapshots WHERE watcher_id = ?"
+                        " ORDER BY id DESC LIMIT ?", (watcher_id, limit))
+    return [dict(r) for r in rows]
+
+
+def count_alerts(conn, watcher_id, *, kind=None, title_like=None, within_hours=1):
+    q = ("SELECT COUNT(*) FROM alerts WHERE watcher_id = ?"
+         " AND ts >= datetime('now', ?)")
+    args = [watcher_id, f"-{int(within_hours)} hour"]
+    if kind:
+        q += " AND kind = ?"
+        args.append(kind)
+    if title_like:
+        q += " AND title LIKE ?"
+        args.append(f"%{title_like}%")
+    return conn.execute(q, args).fetchone()[0]
 
 
 def record_alert(conn, watcher_id, *, title, message, kind):
