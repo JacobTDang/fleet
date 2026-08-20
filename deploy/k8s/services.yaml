@@ -1,0 +1,26 @@
+# Tailscale operator exposure: each Service gets its own tailnet hostname via
+# loadBalancerClass: tailscale. Nothing here ever listens on the LAN — the
+# k8s-native version of compose's "bind to the tailscale IP".
+apiVersion: v1
+kind: Service
+metadata:
+  name: fleet-dash
+  annotations:
+    tailscale.com/hostname: fleet-dash
+spec:
+  type: LoadBalancer
+  loadBalancerClass: tailscale
+  selector: {app: fleet-core}
+  ports: [{name: http, port: 80, targetPort: 8686}]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fleet-mcp
+  annotations:
+    tailscale.com/hostname: fleet-mcp
+spec:
+  type: LoadBalancer
+  loadBalancerClass: tailscale
+  selector: {app: fleet-core}
+  ports: [{name: http, port: 80, targetPort: 8765}]

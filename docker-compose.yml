@@ -18,6 +18,8 @@ services:
       - fleet-data:/data
       - ./backups:/backups
     ports:
+      # 8686 serves the read-only dashboard (/, /runs, /alerts, /audit),
+      # webhook ingress (POST /hook/<name>/<secret>), and /health.
       - "${BIND_IP:-127.0.0.1}:${FLEET_HEALTH_PORT:-8686}:8686"
     depends_on:
       - ntfy

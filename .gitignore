@@ -6,3 +6,4 @@ __pycache__/
 data/
 backups/
 dist/
+deploy/k8s/secrets.yaml

@@ -143,3 +143,15 @@ async def test_script_timeout_is_error():
 async def test_unknown_kind_is_error_result():
     r = await run_check(watcher("carrier_pigeon"), client=None)
     assert not r.ok and "kind" in r.error
+
+
+async def test_webhook_kind_uses_pushed_value():
+    w = {"kind": "webhook", "target": "hook", "pushed_value": "42"}
+    r = await run_check(w, client=None)
+    assert r.ok and r.value == "42"
+
+
+async def test_webhook_kind_without_push_is_not_modified():
+    w = {"kind": "webhook", "target": "hook", "pushed_value": None}
+    r = await run_check(w, client=None)
+    assert r.ok and r.not_modified

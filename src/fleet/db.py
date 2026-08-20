@@ -1,22 +1,32 @@
 """SQLite layer: watchers are rows; one engine schedules them all."""
 
+import json
+import secrets as _secrets
 import sqlite3
 from urllib.parse import urlsplit
 
-KINDS = ("http_json", "http_text", "script")
+from fleet import cron as cron_mod
+
+KINDS = ("http_json", "http_text", "script", "webhook")
 MIN_INTERVAL = 30
+SCHEMA_VERSION = 2
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS watchers (
   id INTEGER PRIMARY KEY,
   name TEXT NOT NULL UNIQUE,
-  kind TEXT NOT NULL CHECK (kind IN ('http_json','http_text','script')),
+  kind TEXT NOT NULL CHECK (kind IN ('http_json','http_text','script','webhook')),
   target TEXT NOT NULL,
   extract TEXT,
   interval_seconds INTEGER NOT NULL CHECK (interval_seconds >= 30),
   domain TEXT NOT NULL,
   enabled INTEGER NOT NULL DEFAULT 1,
   notify_title TEXT,
+  cron TEXT,
+  handler_prompt TEXT,
+  handler_allow_fleetctl INTEGER NOT NULL DEFAULT 0,
+  fallback_ok INTEGER NOT NULL DEFAULT 1,
+  webhook_secret TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE TABLE IF NOT EXISTS state (
@@ -27,7 +37,8 @@ CREATE TABLE IF NOT EXISTS state (
   last_modified TEXT,
   last_changed_at TEXT,
   consecutive_failures INTEGER NOT NULL DEFAULT 0,
-  next_run_at REAL NOT NULL DEFAULT 0
+  next_run_at REAL NOT NULL DEFAULT 0,
+  pushed_value TEXT
 );
 CREATE TABLE IF NOT EXISTS checks (
   id INTEGER PRIMARY KEY,
@@ -43,15 +54,73 @@ CREATE TABLE IF NOT EXISTS alerts (
   ts TEXT NOT NULL DEFAULT (datetime('now')),
   title TEXT NOT NULL,
   message TEXT NOT NULL,
-  kind TEXT NOT NULL CHECK (kind IN ('change','error','recovery'))
+  kind TEXT NOT NULL CHECK (kind IN ('change','error','recovery','job'))
+);
+CREATE TABLE IF NOT EXISTS jobs (
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE,
+  kind TEXT NOT NULL CHECK (kind IN ('script','claude')),
+  target TEXT NOT NULL,
+  schedule TEXT NOT NULL,
+  tz TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  notify_policy TEXT NOT NULL DEFAULT 'on_failure'
+    CHECK (notify_policy IN ('on_failure','always','on_output','never')),
+  notify_title TEXT,
+  timeout_seconds INTEGER NOT NULL,
+  retries INTEGER NOT NULL DEFAULT 0,
+  retry_delay_seconds INTEGER NOT NULL DEFAULT 60,
+  defer_ok INTEGER NOT NULL DEFAULT 0,
+  fallback_ok INTEGER NOT NULL DEFAULT 1,
+  max_runs_per_day INTEGER,
+  model TEXT,
+  allow_tools INTEGER NOT NULL DEFAULT 0,
+  allow_fleetctl INTEGER NOT NULL DEFAULT 0,
+  handler_prompt TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS job_state (
+  job_id INTEGER PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
+  next_run_at REAL NOT NULL DEFAULT 0,
+  running INTEGER NOT NULL DEFAULT 0,
+  consecutive_failures INTEGER NOT NULL DEFAULT 0,
+  last_status TEXT
+);
+CREATE TABLE IF NOT EXISTS runs (
+  id INTEGER PRIMARY KEY,
+  job_id INTEGER REFERENCES jobs(id) ON DELETE CASCADE,
+  watcher_id INTEGER REFERENCES watchers(id) ON DELETE CASCADE,
+  scheduled_for REAL,
+  started_at REAL,
+  finished_at REAL,
+  status TEXT NOT NULL CHECK (status IN
+    ('ok','fail','timeout','missed','skipped_overlap','budget_skipped','deferred')),
+  exit_code INTEGER,
+  output TEXT,
+  error TEXT,
+  attempt INTEGER NOT NULL DEFAULT 1,
+  llm_tier TEXT,
+  ts TEXT NOT NULL DEFAULT (datetime('now')),
+  CHECK ((job_id IS NULL) != (watcher_id IS NULL))
+);
+CREATE INDEX IF NOT EXISTS idx_runs_job_ts ON runs(job_id, ts);
+CREATE TABLE IF NOT EXISTS audit (
+  id INTEGER PRIMARY KEY,
+  ts TEXT NOT NULL DEFAULT (datetime('now')),
+  source TEXT NOT NULL CHECK (source IN ('mcp','fleetctl','engine')),
+  entity TEXT NOT NULL CHECK (entity IN ('watcher','job')),
+  entity_id INTEGER,
+  action TEXT NOT NULL,
+  detail TEXT
 );
 """
 
 _STATE_FIELDS = {
     "last_value", "last_hash", "etag", "last_modified",
-    "last_changed_at", "consecutive_failures", "next_run_at",
+    "last_changed_at", "consecutive_failures", "next_run_at", "pushed_value",
 }
-_WATCHER_FIELDS = {"name", "target", "extract", "interval_seconds", "notify_title", "kind"}
+_WATCHER_FIELDS = {"name", "target", "extract", "interval_seconds", "notify_title", "kind",
+                   "cron", "handler_prompt", "handler_allow_fleetctl", "fallback_ok"}
 
 
 def connect(path):
@@ -60,14 +129,86 @@ def connect(path):
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=5000")
     conn.execute("PRAGMA foreign_keys=ON")
+    _migrate(conn)
     conn.executescript(_SCHEMA)
     conn.commit()
     return conn
 
 
+def connect_ro(path):
+    """Read-only connection for the dashboard: writes are impossible at the
+    driver level, not merely avoided."""
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=5000")
+    return conn
+
+
+def _migrate(conn):
+    v = conn.execute("PRAGMA user_version").fetchone()[0]
+    if v >= SCHEMA_VERSION:
+        return
+    has_watchers = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='watchers'").fetchone()
+    if has_watchers:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(watchers)")}
+        if "cron" not in cols:
+            _migrate_v1_to_v2(conn)
+    conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+    conn.commit()
+
+
+def _migrate_v1_to_v2(conn):
+    # watchers and alerts carry CHECK constraints that must widen ('webhook',
+    # 'job'); SQLite can't ALTER a CHECK, so rebuild those two tables.
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.executescript("""
+    BEGIN;
+    CREATE TABLE watchers_v2 (
+      id INTEGER PRIMARY KEY,
+      name TEXT NOT NULL UNIQUE,
+      kind TEXT NOT NULL CHECK (kind IN ('http_json','http_text','script','webhook')),
+      target TEXT NOT NULL,
+      extract TEXT,
+      interval_seconds INTEGER NOT NULL CHECK (interval_seconds >= 30),
+      domain TEXT NOT NULL,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      notify_title TEXT,
+      cron TEXT,
+      handler_prompt TEXT,
+      handler_allow_fleetctl INTEGER NOT NULL DEFAULT 0,
+      fallback_ok INTEGER NOT NULL DEFAULT 1,
+      webhook_secret TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    INSERT INTO watchers_v2 (id, name, kind, target, extract, interval_seconds,
+                             domain, enabled, notify_title, created_at)
+      SELECT id, name, kind, target, extract, interval_seconds,
+             domain, enabled, notify_title, created_at FROM watchers;
+    DROP TABLE watchers;
+    ALTER TABLE watchers_v2 RENAME TO watchers;
+    CREATE TABLE alerts_v2 (
+      id INTEGER PRIMARY KEY,
+      watcher_id INTEGER REFERENCES watchers(id) ON DELETE SET NULL,
+      ts TEXT NOT NULL DEFAULT (datetime('now')),
+      title TEXT NOT NULL,
+      message TEXT NOT NULL,
+      kind TEXT NOT NULL CHECK (kind IN ('change','error','recovery','job'))
+    );
+    INSERT INTO alerts_v2 SELECT * FROM alerts;
+    DROP TABLE alerts;
+    ALTER TABLE alerts_v2 RENAME TO alerts;
+    ALTER TABLE state ADD COLUMN pushed_value TEXT;
+    COMMIT;
+    """)
+    conn.execute("PRAGMA foreign_keys=ON")
+
+
 def _domain_for(kind, target):
     if kind == "script":
         return "local"
+    if kind == "webhook":
+        return "webhook"
     netloc = urlsplit(target).netloc.lower()
     if not netloc:
         raise ValueError(f"target must be an absolute URL, got: {target!r}")
@@ -75,16 +216,23 @@ def _domain_for(kind, target):
 
 
 def create_watcher(conn, *, name, kind, target, extract=None,
-                   interval_seconds=300, notify_title=None):
+                   interval_seconds=300, notify_title=None, cron=None,
+                   handler_prompt=None, handler_allow_fleetctl=False, fallback_ok=True):
     if kind not in KINDS:
         raise ValueError(f"kind must be one of {KINDS}, got: {kind!r}")
     if interval_seconds < MIN_INTERVAL:
         raise ValueError(f"interval_seconds must be >= {MIN_INTERVAL} (politeness floor)")
+    if cron is not None:
+        cron_mod.validate(cron)
     domain = _domain_for(kind, target)
+    webhook_secret = _secrets.token_urlsafe(24) if kind == "webhook" else None
     cur = conn.execute(
-        "INSERT INTO watchers (name, kind, target, extract, interval_seconds, domain, notify_title)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (name, kind, target, extract, interval_seconds, domain, notify_title),
+        "INSERT INTO watchers (name, kind, target, extract, interval_seconds, domain,"
+        " notify_title, cron, handler_prompt, handler_allow_fleetctl, fallback_ok,"
+        " webhook_secret) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (name, kind, target, extract, interval_seconds, domain, notify_title, cron,
+         handler_prompt, 1 if handler_allow_fleetctl else 0, 1 if fallback_ok else 0,
+         webhook_secret),
     )
     conn.execute("INSERT INTO state (watcher_id) VALUES (?)", (cur.lastrowid,))
     conn.commit()
@@ -113,6 +261,8 @@ def update_watcher(conn, watcher_id, **fields):
         raise ValueError(f"unknown watcher fields: {sorted(unknown)}")
     if "interval_seconds" in fields and fields["interval_seconds"] < MIN_INTERVAL:
         raise ValueError(f"interval_seconds must be >= {MIN_INTERVAL} (politeness floor)")
+    if fields.get("cron") is not None:
+        cron_mod.validate(fields["cron"])
     current = get_watcher(conn, watcher_id)
     if current is None:
         raise ValueError(f"no watcher with id {watcher_id}")
@@ -140,7 +290,7 @@ def delete_watcher(conn, watcher_id):
 def due_watchers(conn, now):
     rows = conn.execute(
         "SELECT w.*, s.last_value, s.last_hash, s.etag, s.last_modified,"
-        " s.last_changed_at, s.consecutive_failures, s.next_run_at"
+        " s.last_changed_at, s.consecutive_failures, s.next_run_at, s.pushed_value"
         " FROM watchers w JOIN state s ON s.watcher_id = w.id"
         " WHERE w.enabled = 1 AND s.next_run_at <= ? ORDER BY s.next_run_at",
         (now,),
@@ -205,3 +355,16 @@ def prune_checks(conn, keep_days=30):
                        (f"-{int(keep_days)} day",))
     conn.commit()
     return cur.rowcount
+
+
+def record_audit(conn, *, source, entity, entity_id, action, detail=None):
+    if isinstance(detail, (dict, list)):
+        detail = json.dumps(detail, ensure_ascii=False)
+    conn.execute("INSERT INTO audit (source, entity, entity_id, action, detail)"
+                 " VALUES (?, ?, ?, ?, ?)", (source, entity, entity_id, action, detail))
+    conn.commit()
+
+
+def recent_audit(conn, limit=50):
+    rows = conn.execute("SELECT * FROM audit ORDER BY id DESC LIMIT ?", (limit,))
+    return [dict(r) for r in rows]

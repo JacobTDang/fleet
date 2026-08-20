@@ -16,8 +16,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import httpx
 
-from fleet import db
+from fleet import cron, db
+from fleet import jobs as jobs_db
 from fleet.checkers import run_check
+from fleet.jobrunner import FAR_FUTURE, process_job, run_judged
+from fleet.llm import Llm
 from fleet.notify import Notifier, NotifyError
 from fleet.scheduler import DomainGate, next_run
 
@@ -93,12 +96,18 @@ async def _alert(conn, w, notifier, health, *, title, message, kind, priority="d
 
 
 async def process_watcher(conn, w, *, client, notifier, gate, rng,
-                          fail_threshold=3, now_fn=time.time, health=None):
+                          fail_threshold=3, now_fn=time.time, health=None,
+                          llm=None, global_budget=24, tz_name="UTC"):
     async with gate.slot(w["domain"]):
         result = await run_check(w, client)
     now = now_fn()
     prev_failures = w["consecutive_failures"]
-    state = {"next_run_at": next_run(w["interval_seconds"], now=now, rng=rng)}
+    if w["kind"] == "webhook":
+        state = {"next_run_at": FAR_FUTURE, "pushed_value": None}
+    elif w.get("cron"):
+        state = {"next_run_at": cron.next_fire(w["cron"], tz_name, now)}
+    else:
+        state = {"next_run_at": next_run(w["interval_seconds"], now=now, rng=rng)}
 
     if result.ok:
         if result.not_modified:
@@ -115,9 +124,19 @@ async def process_watcher(conn, w, *, client, notifier, gate, rng,
             elif new_hash != w["last_hash"]:
                 detail = f"{_trunc(w['last_value'])} -> {_trunc(result.value)}"
                 db.record_check(conn, w["id"], "changed", detail=detail)
+                message = detail
+                if w.get("handler_prompt"):
+                    context = (f"Watcher {w['name']} changed.\n"
+                               f"Old: {_trunc(w['last_value'], 1000)}\n"
+                               f"New: {_trunc(result.value, 1000)}")
+                    message = await run_judged(
+                        conn, llm, handler_prompt=w["handler_prompt"], context=context,
+                        raw_message=detail, fallback_ok=bool(w["fallback_ok"]),
+                        allow_fleetctl=bool(w["handler_allow_fleetctl"]),
+                        watcher_id=w["id"], global_budget=global_budget)
                 await _alert(conn, w, notifier, health,
                              title=w["notify_title"] or f"{w['name']} changed",
-                             message=detail, kind="change")
+                             message=message, kind="change")
                 state.update(last_value=result.value, last_hash=new_hash,
                              last_changed_at=str(now))
             else:
@@ -141,28 +160,42 @@ async def process_watcher(conn, w, *, client, notifier, gate, rng,
     db.update_state(conn, w["id"], **state)
 
 
-async def tick(conn, *, client, notifier, gate, rng, fail_threshold=3,
-               max_concurrent=20, now_fn=time.time, health=None):
+async def tick(conn, *, client, notifier, gate, rng, llm=None, fail_threshold=3,
+               max_concurrent=20, jobs_max_concurrent=5, grace_seconds=3600,
+               defer_seconds=3600, global_budget=24, tz_name="UTC",
+               now_fn=time.time, health=None):
     due = db.due_watchers(conn, now_fn())
+    due_jobs = jobs_db.due_jobs(conn, now_fn())
     sem = asyncio.Semaphore(max_concurrent)
+    jsem = asyncio.Semaphore(jobs_max_concurrent)  # a slow job never starves a watcher
 
     async def bounded(w):
         async with sem:
             await process_watcher(conn, w, client=client, notifier=notifier,
                                   gate=gate, rng=rng, fail_threshold=fail_threshold,
-                                  now_fn=now_fn, health=health)
+                                  now_fn=now_fn, health=health, llm=llm,
+                                  global_budget=global_budget, tz_name=tz_name)
 
-    if due:
-        await asyncio.gather(*(bounded(w) for w in due))
+    async def bounded_job(j):
+        async with jsem:
+            await process_job(conn, j, llm=llm, notifier=notifier, now_fn=now_fn,
+                              grace_seconds=grace_seconds, defer_seconds=defer_seconds,
+                              global_budget=global_budget, health=health)
+
+    work = [bounded(w) for w in due] + [bounded_job(j) for j in due_jobs]
+    if work:
+        await asyncio.gather(*work)
     if health:
         health.tick_done(now_fn())
-    return len(due)
+    return len(due) + len(due_jobs)
 
 
 async def _main():
     tick_seconds = float(os.environ.get("FLEET_TICK_SECONDS", "5"))
     health = Health(tick_seconds=tick_seconds)
-    start_health_server(health, port=int(os.environ.get("FLEET_HEALTH_PORT", "8686")))
+    from fleet.webui import start_web_server  # deferred: webui imports jobrunner
+    start_web_server(health, os.environ["FLEET_DB"],
+                     port=int(os.environ.get("FLEET_HEALTH_PORT", "8686")))
     conn = db.connect(os.environ["FLEET_DB"])
     client = httpx.AsyncClient(
         timeout=30.0,
@@ -176,15 +209,29 @@ async def _main():
     )
     gate = DomainGate(min_gap=float(os.environ.get("FLEET_DOMAIN_MIN_GAP", "2.0")))
     rng = random.Random()
+    llm = Llm(
+        fallback_url=os.environ.get("FLEET_FALLBACK_LLM_URL") or None,
+        fallback_key=os.environ.get("FLEET_FALLBACK_LLM_KEY") or None,
+        fallback_models=[m.strip() for m in
+                         os.environ.get("FLEET_FALLBACK_MODELS", "").split(",") if m.strip()],
+    )
     fail_threshold = int(os.environ.get("FLEET_FAIL_THRESHOLD", "3"))
     max_concurrent = int(os.environ.get("FLEET_MAX_CONCURRENT", "20"))
+    jobs_max_concurrent = int(os.environ.get("FLEET_JOBS_MAX_CONCURRENT", "5"))
+    grace_seconds = float(os.environ.get("FLEET_GRACE_SECONDS", "3600"))
+    defer_seconds = float(os.environ.get("FLEET_DEFER_SECONDS", "3600"))
+    global_budget = int(os.environ.get("FLEET_CLAUDE_MAX_RUNS_PER_DAY", "24"))
+    tz_name = os.environ.get("FLEET_TZ", "UTC")
     print(f"[fleet] worker up: db={os.environ['FLEET_DB']} tick={tick_seconds}s", flush=True)
     while True:
         n = await tick(conn, client=client, notifier=notifier, gate=gate, rng=rng,
-                       fail_threshold=fail_threshold, max_concurrent=max_concurrent,
-                       health=health)
+                       llm=llm, fail_threshold=fail_threshold,
+                       max_concurrent=max_concurrent,
+                       jobs_max_concurrent=jobs_max_concurrent,
+                       grace_seconds=grace_seconds, defer_seconds=defer_seconds,
+                       global_budget=global_budget, tz_name=tz_name, health=health)
         if n:
-            print(f"[fleet] tick: {n} watcher(s) checked", flush=True)
+            print(f"[fleet] tick: {n} item(s) run", flush=True)
         await asyncio.sleep(tick_seconds)
 
 

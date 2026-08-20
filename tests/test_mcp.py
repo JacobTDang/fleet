@@ -82,3 +82,51 @@ async def test_all_tools_are_registered_on_the_mcp_server():
         "watcher_resume", "watcher_delete", "watcher_test",
         "fleet_stats", "recent_alerts", "recent_errors",
     } <= tools
+
+
+from fleet import jobs
+
+
+async def test_job_tools_registered():
+    names = {t.name for t in await m.mcp.list_tools()}
+    assert {"job_create", "job_list", "job_update", "job_pause", "job_resume",
+            "job_delete", "job_run_now", "job_history"} <= names
+
+
+def test_job_create_defaults_tz_and_audits(fleet_db, monkeypatch):
+    monkeypatch.setenv("FLEET_TZ", "America/New_York")
+    j = m.job_create(name="digest", kind="script", target="echo hi",
+                     schedule="0 9 * * *")
+    assert j["tz"] == "America/New_York" and j["notify_policy"] == "on_failure"
+    conn = db.connect(fleet_db)
+    a = db.recent_audit(conn)[0]
+    assert (a["source"], a["entity"], a["action"]) == ("mcp", "job", "create")
+    conn.close()
+
+
+def test_job_lifecycle_tools(fleet_db):
+    m.job_create(name="digest", kind="script", target="echo hi", schedule="0 9 * * *")
+    assert m.job_pause("digest")["enabled"] == 0
+    assert m.job_resume("digest")["enabled"] == 1
+    import time
+    before = time.time()
+    m.job_run_now("digest")
+    conn = db.connect(fleet_db)
+    assert before <= jobs.list_jobs(conn)[0]["next_run_at"] <= time.time()
+    jobs.record_run(conn, job_id=1, status="ok", output="hi")
+    conn.close()
+    assert m.job_history("digest")[0]["status"] == "ok"
+    assert m.job_update("digest", notify_policy="always")["notify_policy"] == "always"
+    assert m.job_delete("digest") == {"deleted": "digest"}
+
+
+def test_watcher_create_accepts_v2_params_and_audits(fleet_db):
+    w = m.watcher_create(name="hook", kind="webhook", target="tv",
+                         handler_prompt="judge it", fallback_ok=False)
+    assert w["webhook_secret"] and w["fallback_ok"] == 0
+    w2 = m.watcher_create(name="mkt", kind="script", target="echo v",
+                          cron="0 9 * * 1-5")
+    assert w2["cron"] == "0 9 * * 1-5"
+    conn = db.connect(fleet_db)
+    assert len([a for a in db.recent_audit(conn) if a["action"] == "create"]) == 2
+    conn.close()

@@ -191,3 +191,88 @@ def test_health_server_serves_json():
         assert resp.status == 200 and body["status"] == "ok"
     finally:
         server.shutdown()
+
+
+from fleet import jobs
+from fleet.jobrunner import FAR_FUTURE
+from fleet.llm import LlmResult
+from fleet.worker import tick as worker_tick
+
+
+async def test_webhook_watcher_full_pipeline(conn):
+    w = db.create_watcher(conn, name="hook", kind="webhook", target="tv")
+    env = make_env(lambda req: httpx.Response(500))  # HTTP client must not be touched
+    await run_once(conn, env)                        # first tick parks it
+    s = db.get_state(conn, w["id"])
+    assert s["next_run_at"] == FAR_FUTURE and env["notifier"].sent == []
+    db.update_state(conn, w["id"], pushed_value="a", next_run_at=0)
+    await run_once(conn, env)                        # baseline
+    db.update_state(conn, w["id"], pushed_value="b", next_run_at=0)
+    await run_once(conn, env)                        # change -> alert
+    assert len(env["notifier"].sent) == 1
+    s = db.get_state(conn, w["id"])
+    assert s["pushed_value"] is None and s["next_run_at"] == FAR_FUTURE
+
+
+async def test_cron_watcher_next_run_uses_schedule(conn):
+    db.create_watcher(conn, name="mkt", kind="script", target="echo v",
+                      cron="0 9 * * *", interval_seconds=60)
+    env = make_env(lambda req: httpx.Response(200, text="v"))
+    await run_once(conn, env)
+    nr = db.get_state(conn, 1)["next_run_at"]
+    assert nr > NOW + 3600  # next 9am, far beyond interval+jitter
+
+
+async def test_change_handler_judges_message(conn):
+    class GoodLlm:
+        has_fallback = False
+
+        async def complete(self, prompt, **kw):
+            assert "judge" in prompt and "v2" in prompt
+            return LlmResult(ok=True, text="big deal", tier="subscription")
+
+    db.create_watcher(conn, name="w", kind="http_text", target="https://a.com",
+                      interval_seconds=60, handler_prompt="judge this change")
+    env = make_env(lambda req: httpx.Response(200, text="v1"))
+    env["llm"] = GoodLlm()
+    await run_once(conn, env)
+    env2 = make_env(lambda req: httpx.Response(200, text="v2"))
+    env2["llm"] = GoodLlm()
+    db.update_state(conn, 1, next_run_at=0)
+    await run_once(conn, env2)
+    assert env2["notifier"].sent[0][1] == "big deal"
+    assert jobs.recent_runs(conn)[0]["llm_tier"] == "subscription"
+
+
+async def test_change_handler_failure_passes_raw_unjudged(conn):
+    class DeadLlm:
+        has_fallback = False
+
+        async def complete(self, prompt, **kw):
+            return LlmResult(ok=False, error="usage limit")
+
+    db.create_watcher(conn, name="w", kind="http_text", target="https://a.com",
+                      interval_seconds=60, handler_prompt="judge")
+    env = make_env(lambda req: httpx.Response(200, text="v1"))
+    env["llm"] = DeadLlm()
+    await run_once(conn, env)
+    env2 = make_env(lambda req: httpx.Response(200, text="v2"))
+    env2["llm"] = DeadLlm()
+    db.update_state(conn, 1, next_run_at=0)
+    await run_once(conn, env2)
+    title, msg, _ = env2["notifier"].sent[0]
+    assert msg.startswith("[unjudged] ") and "v1" in msg and "v2" in msg
+
+
+async def test_tick_runs_jobs_and_watchers(conn):
+    db.create_watcher(conn, name="w", kind="http_text", target="https://a.com",
+                      interval_seconds=60)
+    j = jobs.create_job(conn, now=NOW, name="j", kind="script",
+                        target="echo done", schedule="* * * * *", tz="UTC",
+                        notify_policy="always")
+    jobs.update_job_state(conn, j["id"], next_run_at=NOW)
+    env = make_env(lambda req: httpx.Response(200, text="v"))
+    n = await worker_tick(conn, **env)
+    assert n == 2
+    assert jobs.recent_runs(conn, job_id=j["id"])[0]["status"] == "ok"
+    assert any(m == "done" for _, m, _ in env["notifier"].sent)
