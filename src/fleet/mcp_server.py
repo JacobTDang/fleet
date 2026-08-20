@@ -224,7 +224,8 @@ def job_run_now(ident: int | str) -> dict:
     """Fire a job on the next engine tick (a few seconds)."""
     with _conn() as conn:
         j = _resolve_job(conn, ident)
-        jobs.update_job_state(conn, j["id"], next_run_at=0)
+        # "now", not 0: epoch 0 would look decades late and trip the grace window
+        jobs.update_job_state(conn, j["id"], next_run_at=time.time())
         db.record_audit(conn, source="mcp", entity="job", entity_id=j["id"], action="run-now")
         return {"queued": j["name"]}
 

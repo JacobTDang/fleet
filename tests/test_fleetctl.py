@@ -55,10 +55,15 @@ def test_pause_resume_both_entities(env):
     conn.close()
 
 
-def test_run_now_wakes_job(env):
+def test_run_now_schedules_for_now_not_epoch_zero(env):
+    import time
+    before = time.time()
     assert main(["run-now", "digest"]) == 0
     conn = db.connect(env)
-    assert jobs.list_jobs(conn)[0]["next_run_at"] == 0
+    nr = jobs.list_jobs(conn)[0]["next_run_at"]
+    # epoch 0 would look 50 years late and trip the grace window ("missed");
+    # a manual fire must be scheduled for the present moment
+    assert before <= nr <= time.time()
     assert db.recent_audit(conn)[0]["action"] == "run-now"
     conn.close()
 

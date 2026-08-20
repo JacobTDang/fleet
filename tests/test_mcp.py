@@ -108,9 +108,11 @@ def test_job_lifecycle_tools(fleet_db):
     m.job_create(name="digest", kind="script", target="echo hi", schedule="0 9 * * *")
     assert m.job_pause("digest")["enabled"] == 0
     assert m.job_resume("digest")["enabled"] == 1
+    import time
+    before = time.time()
     m.job_run_now("digest")
     conn = db.connect(fleet_db)
-    assert jobs.list_jobs(conn)[0]["next_run_at"] == 0
+    assert before <= jobs.list_jobs(conn)[0]["next_run_at"] <= time.time()
     jobs.record_run(conn, job_id=1, status="ok", output="hi")
     conn.close()
     assert m.job_history("digest")[0]["status"] == "ok"
