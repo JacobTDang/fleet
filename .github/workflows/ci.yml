@@ -1,0 +1,115 @@
+name: CI
+
+# Deliberately main-only (plus manual dispatch): this is a solo private repo
+# with metered Actions minutes, so CI is a post-merge canary on main rather
+# than a per-PR gate. The consequence to know: a merge is verified *after* it
+# lands, so run `uv run pytest` and `./scripts/smoke.sh` locally before merging
+# anything you care about.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Least privilege: nothing here writes to the repo.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUFF_VERSION: "0.16.3"
+  KUBECONFORM_VERSION: "v0.8.0"
+
+jobs:
+  test:
+    name: tests (py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.12 is what the deploy image runs; 3.13 catches deprecations early.
+        python: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+        with:
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+      - name: Install from the lockfile
+        # --locked also fails if uv.lock drifted from pyproject.toml
+        run: uv sync --locked
+      - name: Run the suite
+        run: uv run pytest -q --durations=5
+
+  checks:
+    name: lint, manifests, guards
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+
+      - name: Lint (ruff)
+        run: uvx ruff@${{ env.RUFF_VERSION }} check .
+
+      - name: Shell scripts (shellcheck)
+        # severity=warning: SC2012 (ls vs find) is info-level style advice on
+        # backup filenames this repo generates itself.
+        run: |
+          shellcheck --severity=warning \
+            deploy/*.sh deploy/watchdog/*.sh deploy/k8s/*.sh scripts/*.sh
+
+      - name: Compose file
+        run: |
+          cp .env.example .env
+          docker compose config -q
+
+      - name: Kubernetes manifests (kubeconform, checksum-verified)
+        run: |
+          base="https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}"
+          curl -fsSLO "${base}/kubeconform-linux-amd64.tar.gz"
+          curl -fsSLO "${base}/CHECKSUMS"
+          grep 'kubeconform-linux-amd64.tar.gz' CHECKSUMS | sha256sum -c -
+          tar xzf kubeconform-linux-amd64.tar.gz kubeconform
+          # -strict rejects unknown fields (typo'd keys silently do nothing on
+          # apply); the Kustomization doc has no schema and is skipped.
+          ./kubeconform -strict -ignore-missing-schemas -summary deploy/k8s/
+
+      - name: No credentials committed
+        run: |
+          tracked="$(git ls-files -- .env 'deploy/k8s/secrets.yaml')"
+          if [ -n "$tracked" ]; then
+            echo "::error::secret file is tracked in git: ${tracked}"
+            exit 1
+          fi
+          if git grep -nIE '(sk-ant-|sk-or-v1-|tskey-)[A-Za-z0-9]{8}' \
+              -- . ':!.github/workflows/*'; then
+            echo "::error::a credential-shaped string is committed"
+            exit 1
+          fi
+          echo "no credential files or token-shaped strings tracked"
+
+  e2e:
+    name: end-to-end smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Deploy artifact sanity
+        # The image is the thing that actually ships; prove the CLI it carries
+        # and the entry points exist before exercising them.
+        run: |
+          docker build -t fleet:ci .
+          docker run --rm fleet:ci claude --version
+          docker run --rm fleet:ci fleetctl --help
+          docker run --rm fleet:ci python -c "import fleet.worker, fleet.mcp_server, fleet.webui"
+
+      - name: Smoke test the live stack
+        # Same script used locally: job fires -> ntfy delivers -> webhook drives
+        # the change pipeline -> dashboard renders -> MCP answers -> state
+        # survives a restart.
+        run: ./scripts/smoke.sh

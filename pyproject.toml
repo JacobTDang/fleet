@@ -30,3 +30,14 @@ packages = ["src/fleet"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+
+[tool.ruff]
+# 110 matches how this codebase is actually written; the point is catching
+# runaway lines, not reflowing working code.
+line-length = 110
+
+[tool.ruff.lint]
+# E/W/F: real errors and dead code. I: import order. B: bugbear (mutable
+# defaults, loop-variable capture). UP: py3.12+ idioms. Deliberately no
+# formatter and no C4/SIM — those force churn without catching bugs.
+select = ["E", "F", "W", "I", "B", "UP"]

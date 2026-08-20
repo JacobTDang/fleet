@@ -1,6 +1,6 @@
 import pytest
 
-from fleet import db
+from fleet import db, jobs
 from fleet import mcp_server as m
 
 
@@ -82,9 +82,6 @@ async def test_all_tools_are_registered_on_the_mcp_server():
         "watcher_resume", "watcher_delete", "watcher_test",
         "fleet_stats", "recent_alerts", "recent_errors",
     } <= tools
-
-
-from fleet import jobs
 
 
 async def test_job_tools_registered():
