@@ -340,7 +340,9 @@ def recent_errors(conn, limit=20):
 
 
 def stats(conn):
-    one = lambda q, *a: conn.execute(q, a).fetchone()[0]
+    def one(q, *a):
+        return conn.execute(q, a).fetchone()[0]
+
     return {
         "watchers": one("SELECT COUNT(*) FROM watchers"),
         "enabled": one("SELECT COUNT(*) FROM watchers WHERE enabled = 1"),

@@ -5,10 +5,13 @@ import urllib.request
 import httpx
 import pytest
 
-from fleet import db
+from fleet import db, jobs
+from fleet.jobrunner import FAR_FUTURE
+from fleet.llm import LlmResult
 from fleet.notify import NotifyError
 from fleet.scheduler import DomainGate
 from fleet.worker import Health, process_watcher, start_health_server, tick
+from fleet.worker import tick as worker_tick
 
 NOW = 1_000_000.0
 
@@ -191,12 +194,6 @@ def test_health_server_serves_json():
         assert resp.status == 200 and body["status"] == "ok"
     finally:
         server.shutdown()
-
-
-from fleet import jobs
-from fleet.jobrunner import FAR_FUTURE
-from fleet.llm import LlmResult
-from fleet.worker import tick as worker_tick
 
 
 async def test_webhook_watcher_full_pipeline(conn):

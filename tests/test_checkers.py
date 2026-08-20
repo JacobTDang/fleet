@@ -1,5 +1,3 @@
-import json
-
 import httpx
 
 from fleet.checkers import run_check

@@ -1,0 +1,15 @@
+version: 2
+updates:
+  # Action versions go stale silently; monthly PRs keep them current without
+  # noise. These PRs land on main before CI sees them (CI is main-only), so
+  # skim the changelog rather than trusting a green check.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+
+  # Watches the Dockerfile base image (python:3.12-slim) for security updates.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: monthly

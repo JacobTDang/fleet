@@ -96,7 +96,7 @@ def test_delete_watcher_cascades_state_and_checks(conn):
 
 
 def test_due_watchers_respects_next_run_and_enabled(conn):
-    a = db.create_watcher(conn, name="due", kind="http_text", target="https://a.com", interval_seconds=60)
+    db.create_watcher(conn, name="due", kind="http_text", target="https://a.com", interval_seconds=60)
     b = db.create_watcher(conn, name="future", kind="http_text", target="https://b.com", interval_seconds=60)
     c = db.create_watcher(conn, name="off", kind="http_text", target="https://c.com", interval_seconds=60)
     db.update_state(conn, b["id"], next_run_at=2_000_000_000.0)

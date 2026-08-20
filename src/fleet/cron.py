@@ -2,7 +2,7 @@
 returned as UTC epochs. cronsim does the parsing and the DST arithmetic
 (nonexistent times fire once after the gap; ambiguous times fire once)."""
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from cronsim import CronSim, CronSimError
@@ -10,7 +10,7 @@ from cronsim import CronSim, CronSimError
 
 def validate(expr):
     try:
-        CronSim(expr, datetime(2026, 1, 1, tzinfo=timezone.utc))
+        CronSim(expr, datetime(2026, 1, 1, tzinfo=UTC))
     except CronSimError as e:
         raise ValueError(f"invalid cron expression {expr!r}: {e}") from e
 

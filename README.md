@@ -67,11 +67,24 @@ Cron-scheduled tasks sharing the same engine, DB, and alerting:
 ## Local development
 
 ```bash
-uv sync && uv run pytest          # 65 tests, all offline
-cp .env.example .env              # add NTFY_DEFAULT_ACCESS=read-write for local smoke
-docker compose up -d --build      # full stack on 127.0.0.1
+uv sync && uv run pytest          # 143 tests, all offline
+uvx ruff@0.16.3 check .           # same lint CI runs
+./scripts/smoke.sh                # end-to-end against a live stack, then tears down
+docker compose up -d --build      # or bring the stack up by hand on 127.0.0.1
 curl -s localhost:8686/health     # worker heartbeat
 ```
+
+`scripts/smoke.sh` is the real safety net: it builds the image, runs a job,
+waits for the ntfy notification, drives the webhook change pipeline, renders
+every dashboard page, completes an MCP handshake, and restarts the worker to
+prove state survives. Both of this project's worst bugs (SQLite WAL over a
+bind mount, `run-now` scheduling at epoch 0) were invisible to unit tests and
+obvious here. `SMOKE_KEEP_STACK=1 ./scripts/smoke.sh` leaves the stack up.
+
+**CI** (`.github/workflows/ci.yml`) runs the suite on Python 3.12/3.13, ruff,
+shellcheck, kubeconform over the k8s manifests, a committed-credential guard,
+and the same smoke test — **on pushes to main only**, so it reports on a merge
+rather than gating it. Run the two commands above locally before merging.
 
 ## Deploy runbook
 
