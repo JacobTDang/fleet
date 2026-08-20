@@ -100,3 +100,13 @@ async def test_no_fallback_configured():
     assert not llm.has_fallback
     r = await llm.complete("q")
     assert not r.ok and r.usage_limited
+
+
+async def test_unauthenticated_cli_is_a_loud_failure_not_a_judgment():
+    # Verified against the real CLI in the image: it exits 1 and prints
+    # "Not logged in · Please run /login" on stdout. Treating that as an answer
+    # would push the login prompt to the phone as if it were a verdict.
+    llm = Llm(exec_fn=fake_exec(1, out="Not logged in · Please run /login"))
+    r = await llm.claude("q")
+    assert not r.ok and not r.usage_limited
+    assert "Not logged in" in r.error

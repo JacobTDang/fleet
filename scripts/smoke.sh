@@ -59,6 +59,8 @@ page_has() { curl -fsS --max-time 5 "${HEALTH}${1}" | grep -q "$2"; }
 # A push sets next_run_at=0; the engine parks the watcher at FAR_FUTURE once it
 # has consumed the value — so "parked again" means "the push was processed".
 hook_parked() { docker compose exec -T worker fleetctl watchers | grep "$HOOK" | grep -q '"next_run_at": 4102444800'; }
+job_running() { docker compose exec -T worker fleetctl jobs | grep 'slow-job' | grep -q '"running": 1'; }
+ticks_now() { curl -fsS --max-time 5 "${HEALTH}/health" | sed -n 's/.*"ticks": \([0-9]*\).*/\1/p'; }
 
 step "stack up"
 [ -f .env ] || cp .env.example .env
@@ -134,5 +136,43 @@ docker compose restart worker >/dev/null
 wait_for "worker healthy again" 90 health_ok
 run_succeeded || fail "run history did not survive the restart"
 ok "run history intact across restart"
+
+step "recovers from a hard kill mid-run"
+# A job killed mid-flight leaves running=1 in the database. Uncleared, every
+# later fire is skipped as an overlap and the job silently never runs again —
+# the exact shape of failure a laptop with no battery produces on a power cut.
+docker compose exec -T worker python - <<'PY' >/dev/null
+import time
+from fleet import db, jobs
+conn = db.connect("/data/fleet.db")
+jobs.create_job(conn, now=time.time(), name="slow-job", kind="script",
+                target="sleep 120", schedule="* * * * *", tz="UTC",
+                timeout_seconds=300, notify_policy="never")
+PY
+docker compose exec -T worker fleetctl run-now slow-job >/dev/null
+wait_for "slow job is in flight" 60 job_running
+
+# A tick that waited on this job would stall every watcher behind it and freeze
+# the heartbeat — which the watchdog and the k8s liveness probe both read as
+# "the box is down". Ticks must keep advancing while the job runs.
+before="$(ticks_now)"
+sleep 12
+after="$(ticks_now)"
+[ "$after" -gt "$before" ] \
+    || fail "tick loop stalled while a long job ran (watchers starve, watchdog pages)"
+ok "ticks advanced ${before} -> ${after} with the long job still running"
+
+docker compose kill worker >/dev/null
+# Pause it through the mcp container (same image, same volume) while the worker
+# is down: otherwise the job legitimately relaunches on the next tick and the
+# assertion below could not tell recovery from a stale flag.
+docker compose exec -T mcp fleetctl pause job slow-job >/dev/null
+docker compose start worker >/dev/null
+wait_for "worker healthy after the kill" 90 health_ok
+docker compose exec -T worker fleetctl jobs | grep 'slow-job' | grep -q '"running": 0' \
+    || fail "stale running flag survived the restart — the job would never run again"
+docker compose exec -T worker fleetctl runs slow-job -n 5 | grep -q 'interrupted by an engine restart' \
+    || fail "the interrupted run was not recorded"
+ok "stale run cleared and recorded"
 
 printf '\nSMOKE PASSED\n'

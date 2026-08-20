@@ -190,3 +190,14 @@ def test_connect_ro_cannot_write(tmp_path):
     with pytest.raises(sqlite3.OperationalError):
         ro.execute("INSERT INTO audit (source, entity, action) VALUES ('mcp','watcher','x')")
     ro.close()
+
+
+def test_consume_push_is_a_compare_and_swap(conn):
+    w = db.create_watcher(conn, name="hook", kind="webhook", target="tv")
+    db.update_state(conn, w["id"], pushed_value="a")
+    assert db.consume_push(conn, w["id"], "a") is True
+    assert db.get_state(conn, w["id"])["pushed_value"] is None
+    # a push that lands while the engine is mid-check must survive the clear
+    db.update_state(conn, w["id"], pushed_value="b")
+    assert db.consume_push(conn, w["id"], "a") is False
+    assert db.get_state(conn, w["id"])["pushed_value"] == "b"

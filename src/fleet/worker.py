@@ -103,7 +103,10 @@ async def process_watcher(conn, w, *, client, notifier, gate, rng,
     now = now_fn()
     prev_failures = w["consecutive_failures"]
     if w["kind"] == "webhook":
-        state = {"next_run_at": FAR_FUTURE, "pushed_value": None}
+        # Park only if no newer push landed while this check ran; otherwise stay
+        # due so the next tick consumes it (see db.consume_push).
+        consumed = db.consume_push(conn, w["id"], w["pushed_value"])
+        state = {"next_run_at": FAR_FUTURE if consumed else 0}
     elif w.get("cron"):
         state = {"next_run_at": cron.next_fire(w["cron"], tz_name, now)}
     else:
@@ -160,14 +163,49 @@ async def process_watcher(conn, w, *, client, notifier, gate, rng,
     db.update_state(conn, w["id"], **state)
 
 
+class JobPool:
+    """Jobs outlive a tick. A claude job can legitimately run ten minutes, and
+    a tick that waited for it would stall every watcher behind it and freeze the
+    health heartbeat — which reads to the watchdog and the k8s liveness probe as
+    "the box is down". So jobs run as background tasks; this pool owns them and
+    caps how many run at once, across ticks rather than within one."""
+
+    def __init__(self, max_concurrent=5):
+        self._sem = asyncio.Semaphore(max_concurrent)
+        self.tasks = set()
+
+    def launch(self, run):
+        task = asyncio.create_task(self._bounded(run))
+        self.tasks.add(task)
+        task.add_done_callback(self._finished)
+        return task
+
+    async def _bounded(self, run):
+        async with self._sem:
+            await run()
+
+    def _finished(self, task):
+        self.tasks.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            print(f"[fleet] job task crashed: {task.exception()!r}", file=sys.stderr)
+
+    async def drain(self):
+        while self.tasks:
+            await asyncio.gather(*tuple(self.tasks), return_exceptions=True)
+
+
 async def tick(conn, *, client, notifier, gate, rng, llm=None, fail_threshold=3,
                max_concurrent=20, jobs_max_concurrent=5, grace_seconds=3600,
                defer_seconds=3600, global_budget=24, tz_name="UTC",
-               now_fn=time.time, health=None):
+               now_fn=time.time, health=None, job_pool=None):
+    """Check every due watcher, launch every due job. Without a job_pool the
+    jobs are drained before returning (single-shot/test use); the daemon passes
+    a long-lived pool so ticks never wait on job execution."""
+    owns_pool = job_pool is None
+    pool = job_pool or JobPool(jobs_max_concurrent)
     due = db.due_watchers(conn, now_fn())
     due_jobs = jobs_db.due_jobs(conn, now_fn())
     sem = asyncio.Semaphore(max_concurrent)
-    jsem = asyncio.Semaphore(jobs_max_concurrent)  # a slow job never starves a watcher
 
     async def bounded(w):
         async with sem:
@@ -176,15 +214,20 @@ async def tick(conn, *, client, notifier, gate, rng, llm=None, fail_threshold=3,
                                   now_fn=now_fn, health=health, llm=llm,
                                   global_budget=global_budget, tz_name=tz_name)
 
-    async def bounded_job(j):
-        async with jsem:
-            await process_job(conn, j, llm=llm, notifier=notifier, now_fn=now_fn,
-                              grace_seconds=grace_seconds, defer_seconds=defer_seconds,
-                              global_budget=global_budget, health=health)
+    for j in due_jobs:
+        if not j["running"]:
+            # Claim it now: a job queued behind the pool's limit would otherwise
+            # still look due on the next tick and be launched a second time.
+            jobs_db.update_job_state(conn, j["id"], running=1)
+        pool.launch(lambda job=j: process_job(
+            conn, job, llm=llm, notifier=notifier, now_fn=now_fn,
+            grace_seconds=grace_seconds, defer_seconds=defer_seconds,
+            global_budget=global_budget, health=health))
 
-    work = [bounded(w) for w in due] + [bounded_job(j) for j in due_jobs]
-    if work:
-        await asyncio.gather(*work)
+    if due:
+        await asyncio.gather(*(bounded(w) for w in due))
+    if owns_pool:
+        await pool.drain()
     if health:
         health.tick_done(now_fn())
     return len(due) + len(due_jobs)
@@ -197,6 +240,11 @@ async def _main():
     start_web_server(health, os.environ["FLEET_DB"],
                      port=int(os.environ.get("FLEET_HEALTH_PORT", "8686")))
     conn = db.connect(os.environ["FLEET_DB"])
+    for interrupted in jobs_db.clear_running(conn):
+        jobs_db.record_run(conn, job_id=interrupted["id"], status="fail",
+                           error="interrupted by an engine restart")
+        print(f"[fleet] recovered job {interrupted['name']!r} from an interrupted run",
+              file=sys.stderr)
     client = httpx.AsyncClient(
         timeout=30.0,
         headers={"User-Agent": os.environ.get(
@@ -222,6 +270,7 @@ async def _main():
     defer_seconds = float(os.environ.get("FLEET_DEFER_SECONDS", "3600"))
     global_budget = int(os.environ.get("FLEET_CLAUDE_MAX_RUNS_PER_DAY", "24"))
     tz_name = os.environ.get("FLEET_TZ", "UTC")
+    job_pool = JobPool(jobs_max_concurrent)
     print(f"[fleet] worker up: db={os.environ['FLEET_DB']} tick={tick_seconds}s", flush=True)
     while True:
         n = await tick(conn, client=client, notifier=notifier, gate=gate, rng=rng,
@@ -229,9 +278,10 @@ async def _main():
                        max_concurrent=max_concurrent,
                        jobs_max_concurrent=jobs_max_concurrent,
                        grace_seconds=grace_seconds, defer_seconds=defer_seconds,
-                       global_budget=global_budget, tz_name=tz_name, health=health)
+                       global_budget=global_budget, tz_name=tz_name, health=health,
+                       job_pool=job_pool)
         if n:
-            print(f"[fleet] tick: {n} item(s) run", flush=True)
+            print(f"[fleet] tick: {n} item(s) due", flush=True)
         await asyncio.sleep(tick_seconds)
 
 
