@@ -4,6 +4,25 @@ Production deploy: k3s in an Ubuntu Server VM under Proxmox on the laptop.
 docker-compose stays for local dev on the Mac; these manifests are the real
 thing. Access is tailnet-only at every layer.
 
+## 0. The Proxmox VM
+
+The cluster is small (fleet-core, ntfy, a nightly CronJob, the Tailscale
+operator and its proxies — under 1 GB), so the VM does not need to be large:
+
+- **6 GB RAM, 4 vCPU, 40 GB disk**, Ubuntu Server LTS. On a 16 GB laptop that
+  leaves roughly 8 GB free for whatever you build next.
+- CPU type **host** and a **virtio** disk, or you pay for virtualisation you
+  are not using.
+- Install the **QEMU guest agent** in the VM (`qemu-guest-agent`) so Proxmox
+  can shut it down cleanly on power events.
+- **Options → Start at boot: yes.** Without it a power cut brings Proxmox back
+  and leaves the fleet down — with no battery, that will happen.
+- **Snapshot the VM after the base install, before k3s.** A botched k3s or
+  Tailscale setup then costs ten seconds instead of an evening.
+
+Then test the thing that will actually happen: pull the power, and confirm the
+host boots and the VM autostarts without a keyboard attached.
+
 ## 1. Install k3s
 
 On the VM (which already runs tailscaled — SSH over the tailnet works
