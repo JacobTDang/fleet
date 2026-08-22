@@ -1,0 +1,54 @@
+# OPTIONAL — not applied by `kubectl apply -k deploy/k8s`.
+#
+# One pod that renders JavaScript, for watchers with fetch_via="scrape". This
+# is the lightweight alternative to a full Firecrawl stack (7 services): it
+# idles small and only spends memory while a page is actually rendering.
+#
+#   kubectl apply -f deploy/k8s/optional/browserless.yaml
+#   then set in the fleet ConfigMap:
+#     FLEET_SCRAPE_URL: http://browserless:3000/content?token=<the token below>
+#     FLEET_SCRAPE_BODY: {"url": "{{url}}", "gotoOptions": {"waitUntil": "networkidle2"}}
+#     FLEET_SCRAPE_PATH: ""        # this renderer returns raw HTML, not JSON
+#
+# Extracts then run against rendered HTML. Keep them anchored on text you can
+# see (a price, a status word), not on class names, which churn.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: browserless
+  namespace: fleet
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: browserless}
+  template:
+    metadata:
+      labels: {app: browserless}
+    spec:
+      containers:
+        - name: browserless
+          image: ghcr.io/browserless/chromium:latest   # pin after first pull
+          env:
+            - {name: TOKEN, value: "CHANGE-ME"}
+            - {name: CONCURRENT, value: "2"}     # match FLEET_SCRAPE_MAX_CONCURRENT
+            - {name: TIMEOUT, value: "60000"}
+          ports: [{containerPort: 3000}]
+          volumeMounts:
+            - {name: dshm, mountPath: /dev/shm}
+          resources:
+            requests: {memory: 512Mi}
+            limits: {memory: 2Gi}
+      volumes:
+        # Chrome crashes in baffling ways on the default 64Mi /dev/shm
+        - name: dshm
+          emptyDir: {medium: Memory, sizeLimit: 1Gi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: browserless
+  namespace: fleet
+spec:
+  selector: {app: browserless}
+  ports: [{port: 3000, targetPort: 3000}]

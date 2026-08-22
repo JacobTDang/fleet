@@ -11,7 +11,8 @@ you (Mac/phone) ──tailscale──▶ fleet box (home-lab laptop: Proxmox VM 
                                │                  webhook ingress, /health — one process
                                ├─ mcp             management console (Claude Code connects here)
                                ├─ ntfy            self-hosted push notifications
-                               └─ changedetection CSS-selector page-diff watches (own UI)
+                               └─ browserless     OPTIONAL single pod: renders JS for
+                                                  fetch_via="scrape" watchers
                     watchdog box (GCP e2-micro, free, different failure domain)
                                └─ curls /health every 5 min; pulls nightly backups;
                                   alerts via ntfy.sh if the fleet box dies
@@ -99,13 +100,19 @@ selector against what actually arrived. Compose binds Firecrawl to
 `127.0.0.1`, so reach it as `host.docker.internal` from Docker Desktop, or put
 both stacks on one network when deploying to the laptop.
 
-CSS-selector page diffing is delegated to the bundled changedetection.io.
-**Wire its notifications into fleet** rather than running two alert systems:
-create a `webhook` watcher, then set changedetection's notification URL to
-`json://worker:8686/hook/<watcher-name>/<secret>`. Leave `extract` unset at
-first, look at the value fleet captured, then set a dot-path to the field you
-want. Browser-rendered watches then inherit fleet's escalation, handlers,
-audit, and phone alerts.
+For JavaScript-rendered pages, run **one** renderer and point the scrape
+transport at it — `deploy/k8s/optional/browserless.yaml` is a single pod that
+idles small and only spends memory while a page is rendering. Anything
+speaking the same shape works too (a Firecrawl instance elsewhere, a paid
+scraping API); it is one environment variable either way.
+
+The deliberate omission is a second monitoring tool. Page-diffing suites
+(changedetection.io and friends) bring their own scheduler, their own
+notification path, and their own idea of what a change is — a second brain to
+keep in sync, for a job this engine already does with guards, thresholds and
+diffs it can explain. What they still do better is CSS-selector extraction; if
+that becomes the thing you miss, it belongs *inside* fleet as another extract
+kind, not as a parallel system.
 
 ## Jobs
 
