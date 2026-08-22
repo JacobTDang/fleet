@@ -9,8 +9,15 @@ thing. Access is tailnet-only at every layer.
 The cluster is small (fleet-core, ntfy, a nightly CronJob, the Tailscale
 operator and its proxies — under 1 GB), so the VM does not need to be large:
 
-- **6 GB RAM, 4 vCPU, 40 GB disk**, Ubuntu Server LTS. On a 16 GB laptop that
-  leaves roughly 8 GB free for whatever you build next.
+- **4 GB RAM, 4 vCPU, 40 GB disk**, Ubuntu Server LTS. Measured: the whole
+  application layer is ~125 MB (worker 24 MB idle / 27 MB with 50 watchers,
+  mcp 51 MB, ntfy 47 MB) at well under 1% CPU. k3s itself is the real tenant at
+  ~1 GB, plus ~400 MB of OS and ~200 MB of Tailscale proxies — so 4 GB runs
+  about half empty. Go to **6 GB** only if you enable the optional browserless
+  renderer, which wants 0.5–2 GB while a page is rendering.
+- vCPUs are time-shared, not reserved: 4 costs you nothing on a 14–24 core i9
+  and gives the image build some parallelism. This workload is I/O-bound and
+  will idle near zero.
 - CPU type **host** and a **virtio** disk, or you pay for virtualisation you
   are not using.
 - Install the **QEMU guest agent** in the VM (`qemu-guest-agent`) so Proxmox
