@@ -1,5 +1,5 @@
 # Nightly WAL-safe sqlite .backup to a hostPath dir the watchdog box rsyncs
-# (point its pull-backup.sh FLEET_REPO at /var/fleet-backups on the VM).
+# (set FLEET_BACKUP_DIR=/var/fleet-backups in the watchdog's cron env).
 apiVersion: batch/v1
 kind: CronJob
 metadata:

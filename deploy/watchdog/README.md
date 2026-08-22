@@ -24,3 +24,16 @@ monitor can't report its own death.
 7. **Test the failure path once** (this is the whole point): `sudo docker compose stop worker`
    on the fleet box, wait ≤5 min for the urgent push, start it again, expect
    the recovery push. A watchdog whose failure path was never fired is decoration.
+
+## Backup pull: point it at the right directory
+
+`pull-backup.sh` reads `FLEET_BACKUP_DIR` — the directory on the fleet box that
+holds `fleet-latest.db`:
+
+- compose deploy: `fleet/backups` (the default, relative to the remote `$HOME`)
+- k3s deploy: `/var/fleet-backups` (the backup CronJob's hostPath)
+
+It alerts on ntfy.sh if the pull fails **and** if the newest backup is older
+than `BACKUP_MAX_AGE_HOURS` (default 48) — a successful copy of a stale file is
+the failure that otherwise goes unnoticed for months. Break it once on purpose
+(rename the remote file) and confirm the alert lands.
