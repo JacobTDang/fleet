@@ -148,6 +148,7 @@ Cron-scheduled tasks sharing the same engine, DB, and alerting:
 uv sync && uv run pytest          # 197 tests, all offline
 uvx ruff@0.16.3 check .           # same lint CI runs
 ./scripts/smoke.sh                # end-to-end against a live stack, then tears down
+./scripts/check-fallback.sh       # one real call to the LLM fallback provider
 docker compose up -d --build      # or bring the stack up by hand on 127.0.0.1
 curl -s localhost:8686/health     # worker heartbeat
 ```
