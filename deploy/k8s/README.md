@@ -30,8 +30,7 @@ helm upgrade --install tailscale-operator tailscale/tailscale-operator \
 ```
 
 Every Service in this kit with `loadBalancerClass: tailscale` then acquires
-its own tailnet hostname (`fleet-dash`, `fleet-mcp`, `ntfy`,
-`changedetection`). Nothing listens on the LAN. The operator can also proxy
+its own tailnet hostname (`fleet-dash`, `fleet-mcp`, `ntfy`). Nothing listens on the LAN. The operator can also proxy
 the Kubernetes API into the tailnet — the polished alternative to step 1's
 kubeconfig edit.
 
@@ -66,7 +65,7 @@ write surface (MCP). In the admin console's ACL policy:
 ```json
 "acls": [
   {"action": "accept", "src": ["<your-mac>"],
-   "dst": ["fleet-mcp:80", "fleet-dash:80", "ntfy:80", "changedetection:80",
+   "dst": ["fleet-mcp:80", "fleet-dash:80", "ntfy:80",
             "<vm>:22", "<vm>:6443", "<vm>:8686"]},
   {"action": "accept", "src": ["<your-phone>"],
    "dst": ["fleet-dash:80", "ntfy:80"]}
@@ -94,7 +93,15 @@ Run each once; every line has a visible pass/fail:
 5. Create a webhook watcher, POST twice with different bodies → change alert; wrong secret → 403.
 6. `kubectl -n fleet rollout restart deploy/fleet-core` → `fleetctl runs` history intact (PVC + migration survive restarts).
 7. Watchdog (GCP box): point `FLEET_HOST` at `<vm-tailscale-name>`, then **fire the failure path once**: `kubectl -n fleet scale deploy/fleet-core --replicas=0`, wait for the urgent ntfy.sh alert, `--replicas=1`, wait for the recovery message.
-8. Pin image tags: `kubectl -n fleet get pods -o jsonpath='{..imageID}'` and replace the `:latest` tags in ntfy/changedetection manifests.
+8. Pin image tags: `kubectl -n fleet get pods -o jsonpath='{..imageID}'` and replace the `:latest` tag in the ntfy manifest.
+
+## 6b. Optional: JavaScript rendering
+
+`kubectl apply -f deploy/k8s/optional/browserless.yaml` adds one pod that
+renders JS for `fetch_via="scrape"` watchers (set the token, then the three
+`FLEET_SCRAPE_*` keys in the ConfigMap — the file documents them). Deliberately
+not part of `kustomization.yaml`: most targets have a JSON endpoint that needs
+no browser at all, and a browser is the heaviest thing on the node.
 
 ## 7. Fallback door (operator outage)
 
