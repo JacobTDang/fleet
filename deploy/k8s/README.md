@@ -30,10 +30,30 @@ operator and its proxies — under 1 GB), so the VM does not need to be large:
 Then test the thing that will actually happen: pull the power, and confirm the
 host boots and the VM autostarts without a keyboard attached.
 
-## 1. Install k3s
+## 1. Prepare the VM, then install k3s
 
-On the VM (which already runs tailscaled — SSH over the tailnet works
-independently of everything below):
+Three things live on the VM itself, outside the cluster:
+
+```bash
+curl -fsSL https://tailscale.com/install.sh | sh && sudo tailscale up
+curl -fsSL https://get.docker.com | sudo sh && sudo usermod -aG docker "$USER"
+sudo apt install -y git qemu-guest-agent          # log out/in for the docker group
+```
+
+Docker is here **only as a builder**. k3s runs containerd; `build-import.sh`
+hands it the built image directly, so nothing in the cluster ever goes through
+the Docker daemon or a registry.
+
+The repo is private, so give the VM its own read-only credential rather than
+your account: `ssh-keygen -t ed25519` on the VM, add the public key under the
+repo's Settings → Deploy keys, then
+
+```bash
+git clone git@github.com:JacobTDang/fleet.git ~/fleet
+```
+
+Now k3s (tailscaled is already up, so SSH over the tailnet works independently
+of everything below):
 
 ```bash
 curl -sfL https://get.k3s.io | sh -s - --tls-san <vm-tailscale-name>
@@ -82,6 +102,27 @@ kubectl -n fleet exec deploy/ntfy -- ntfy token add <you>
 Put the token in `secrets.yaml` (`NTFY_TOKEN`), re-apply, restart:
 `kubectl -n fleet rollout restart deploy/fleet-core`. Subscribe the phone app
 to `http://ntfy.<tailnet>.ts.net/fleet-alerts` (phone on the tailnet).
+
+## 3b. Shipping a code change
+
+The image is built on the box, so an update is a pull and a rebuild — there is
+nothing to upload:
+
+```bash
+cd ~/fleet && git pull
+./deploy/k8s/build-import.sh
+kubectl -n fleet rollout restart deploy/fleet-core
+```
+
+`fleet:latest` is re-imported over the old tag and `imagePullPolicy:
+IfNotPresent` resolves it locally, so the restart runs the new code. The
+`Recreate` strategy means a few seconds with no engine — deliberate, because
+two writers on one SQLite file is worse than a short gap. Missed fires inside
+the 1h grace window run late rather than being skipped.
+
+Changes to `config.yaml`/`secrets.yaml` need no rebuild at all: `kubectl apply`
+then the same rollout restart. Run `uv run pytest` and `./scripts/smoke.sh` on
+the Mac before pulling — CI reports on main, it does not gate it.
 
 ## 4. Tailscale ACLs — scope the flat tailnet down
 
