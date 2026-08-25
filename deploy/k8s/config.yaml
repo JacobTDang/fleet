@@ -18,4 +18,7 @@ data:
   FLEET_HEALTH_PORT: "8686"
   FLEET_USER_AGENT: fleet-watcher/0.2 (personal monitoring)
   FLEET_FALLBACK_LLM_URL: https://openrouter.ai/api/v1
-  FLEET_FALLBACK_MODELS: ""           # e.g. deepseek/deepseek-chat:free,qwen/qwen3-235b:free
+  # First id is the default; the rest are OpenRouter's server-side failover.
+  # Both are open-weight but NOT free inference (~$0.29/1000 judgments) —
+  # only ids ending in ":free" cost nothing.
+  FLEET_FALLBACK_MODELS: "tencent/hy3,openai/gpt-oss-120b"

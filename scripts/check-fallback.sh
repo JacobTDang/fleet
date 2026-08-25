@@ -16,6 +16,7 @@ cd "$(dirname "$0")/.." || exit 1
 
 uv run python - <<'PY'
 import asyncio
+import os
 import pathlib
 
 from fleet.llm import Llm
@@ -66,8 +67,19 @@ async def main():
               " substituting silently, so a retired model would go unnoticed.")
 
     print("\n3. prime invariant: an unusable ladder still lets the raw alert through")
-    d = await Llm().complete("judge this")
-    print(f"   ok={d.ok} (expected False) — callers degrade to '[unjudged] <raw>'")
+    # Both rungs must genuinely fail. Emptying PATH makes the claude binary
+    # unfindable — a real FileNotFoundError, not a stub — and an Llm() with no
+    # endpoint has no fallback. complete() must still return, never raise.
+    saved, os.environ["PATH"] = os.environ.get("PATH", ""), ""
+    try:
+        d = await Llm().complete("judge this")
+    finally:
+        os.environ["PATH"] = saved
+    print(f"   ok={d.ok} error={(d.error or '')[:70]!r}")
+    if d.ok:
+        raise SystemExit("\n   FAILED — the ladder reported success with both tiers"
+                         " unusable; callers can no longer tell judged from unjudged.")
+    print("   degrades to '[unjudged] <raw>' as required")
     print("\nFALLBACK TIER OK")
 
 
