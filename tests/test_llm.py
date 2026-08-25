@@ -1,3 +1,5 @@
+import json
+
 import httpx
 
 from fleet.llm import Llm, cli_args
@@ -110,3 +112,23 @@ async def test_unauthenticated_cli_is_a_loud_failure_not_a_judgment():
     r = await llm.claude("q")
     assert not r.ok and not r.usage_limited
     assert "Not logged in" in r.error
+
+
+async def test_fallback_models_array_capped_at_provider_limit():
+    """OpenRouter rejects a 'models' array longer than 3 with HTTP 400, which
+    would kill the judgment tier for every call. Send at most 3, keeping the
+    configured order so the first id stays the default."""
+    seen = {}
+
+    def handler(req):
+        seen.update(json.loads(req.content))
+        return ok_fallback(req)
+
+    llm = Llm(fallback_url="https://openrouter.ai/api/v1", fallback_key="k",
+              fallback_models=["a", "b", "c", "d", "e"],
+              client=fallback_client(handler))
+    r = await llm.fallback("q")
+
+    assert r.ok
+    assert seen["model"] == "a"
+    assert seen["models"] == ["a", "b", "c"]

@@ -18,7 +18,7 @@ data:
   FLEET_HEALTH_PORT: "8686"
   FLEET_USER_AGENT: fleet-watcher/0.2 (personal monitoring)
   FLEET_FALLBACK_LLM_URL: https://openrouter.ai/api/v1
-  # First id is the default; the rest are OpenRouter's server-side failover.
-  # Both are open-weight but NOT free inference (~$0.29/1000 judgments) —
-  # only ids ending in ":free" cost nothing.
-  FLEET_FALLBACK_MODELS: "tencent/hy3,openai/gpt-oss-120b"
+  # First id is the default; the rest are OpenRouter's server-side failover, so
+  # list several — free capacity is shared and 429s are routine. OpenRouter
+  # takes at most 3; extras never reach the wire.
+  FLEET_FALLBACK_MODELS: "nvidia/nemotron-3-super-120b-a12b:free,z-ai/glm-5.2:free,openrouter/free"

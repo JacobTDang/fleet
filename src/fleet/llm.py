@@ -11,6 +11,9 @@ from dataclasses import dataclass
 import httpx
 
 USAGE_LIMIT_MARKERS = ("usage limit", "rate limit", "limit reached", "out of usage")
+# OpenRouter rejects a longer 'models' array with HTTP 400 — configure as many
+# ids as you like, but only this many reach the wire, or the tier dies outright.
+MAX_FAILOVER_MODELS = 3
 _LOCKED_TOOLS = "Bash,Edit,Write,NotebookEdit,WebFetch,WebSearch,Task"
 
 
@@ -79,7 +82,8 @@ class Llm:
         headers = {}
         if self._fallback_key:
             headers["Authorization"] = f"Bearer {self._fallback_key}"
-        body = {"model": self._fallback_models[0], "models": self._fallback_models,
+        body = {"model": self._fallback_models[0],
+                "models": self._fallback_models[:MAX_FAILOVER_MODELS],
                 "messages": [{"role": "user", "content": prompt}]}
         client = self._client or httpx.AsyncClient(timeout=60.0)
         try:
