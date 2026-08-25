@@ -30,8 +30,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 3.12 is what the deploy image runs; 3.13 catches deprecations early.
-        python: ["3.12", "3.13"]
+        # 3.14 is what the deploy image runs; 3.12 is the floor in
+        # requires-python, and 3.13 sits between them.
+        python: ["3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: astral-sh/setup-uv@v10.0.1
