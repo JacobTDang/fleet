@@ -1,4 +1,3 @@
-.env
 .venv/
 __pycache__/
 *.pyc
@@ -7,3 +6,26 @@ data/
 backups/
 dist/
 deploy/k8s/secrets.yaml
+
+# Secrets and credentials: never commit these. The *.example files stay tracked.
+.env
+.env.*
+!.env.example
+*.env
+secrets.yaml
+secrets.*.yaml
+!secrets.example.yaml
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+k3s.yaml
+kubeconfig
+*.kubeconfig
+credentials*.json
+
+# Local agent working notes.
+.superpowers/
+.linkc/
