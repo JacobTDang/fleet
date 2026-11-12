@@ -23,6 +23,9 @@ spec:
     metadata:
       labels: {app: fleet-core}
     spec:
+      # Service links inject Docker-style FLEET_MCP_PORT=tcp://... which shadows
+      # the app's own port env and crashes mcp at int(os.environ["FLEET_MCP_PORT"]).
+      enableServiceLinks: false
       containers:
         - name: worker
           image: fleet:latest

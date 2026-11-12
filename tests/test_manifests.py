@@ -35,3 +35,36 @@ def test_gitignore_covers_the_secret_files():
     ignored = (ROOT / ".gitignore").read_text()
     for path in (".env", "deploy/k8s/secrets.yaml"):
         assert path in ignored, f"{path} must be gitignored"
+
+
+# Workload kinds that carry a pod template. Service links inject Docker-style
+# FLEET_MCP_PORT / NTFY_PORT env vars that shadow the app's own config.
+POD_TEMPLATE_KINDS = frozenset({"Deployment", "StatefulSet", "DaemonSet", "Job", "CronJob"})
+
+
+def _manifest_documents(path: Path) -> list[tuple[str, str]]:
+    """Split a multi-doc YAML file into (kind, raw) pairs."""
+    docs: list[tuple[str, str]] = []
+    for raw in path.read_text().split("\n---"):
+        kind = ""
+        for line in raw.splitlines():
+            if line.startswith("kind:"):
+                kind = line.split(":", 1)[1].strip()
+                break
+        if kind:
+            docs.append((kind, raw))
+    return docs
+
+
+def test_pod_templates_disable_service_links():
+    missing = []
+    for path in sorted(K8S.rglob("*.yaml")):
+        for kind, raw in _manifest_documents(path):
+            if kind not in POD_TEMPLATE_KINDS:
+                continue
+            if "enableServiceLinks: false" not in raw:
+                missing.append(f"{path.relative_to(ROOT)} ({kind})")
+    assert missing == [], (
+        "pod templates must set enableServiceLinks: false so Kubernetes "
+        f"does not shadow app env vars: {missing}"
+    )

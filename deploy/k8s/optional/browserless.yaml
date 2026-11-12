@@ -26,6 +26,7 @@ spec:
     metadata:
       labels: {app: browserless}
     spec:
+      enableServiceLinks: false
       containers:
         - name: browserless
           image: ghcr.io/browserless/chromium:latest   # pin after first pull
