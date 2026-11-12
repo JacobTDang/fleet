@@ -103,6 +103,11 @@ Put the token in `secrets.yaml` (`NTFY_TOKEN`), re-apply, restart:
 `kubectl -n fleet rollout restart deploy/fleet-core`. Subscribe the phone app
 to `http://ntfy.<tailnet>.ts.net/fleet-alerts` (phone on the tailnet).
 
+**Claude Code MCP / permissions** (once per cluster): MCP servers and
+permissions that `claude` jobs need are set up once with
+`kubectl -n fleet exec deploy/fleet-core -c worker -- claude mcp add --scope user ...`.
+They persist in `/data/claude`, which the nightly backup also covers.
+
 ## 3b. Shipping a code change
 
 The image is built on the box, so an update is a pull and a rebuild — there is

@@ -68,3 +68,37 @@ def test_pod_templates_disable_service_links():
         "pod templates must set enableServiceLinks: false so Kubernetes "
         f"does not shadow app env vars: {missing}"
     )
+
+
+def _configmap_value(key: str) -> str | None:
+    for line in (K8S / "config.yaml").read_text().splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#") or ":" not in stripped:
+            continue
+        name, _, value = stripped.partition(":")
+        if name == key:
+            return value.split("#", 1)[0].strip().strip('"')
+    return None
+
+
+def _worker_data_mount() -> str:
+    """Mount path of the fleet-core worker's data volume (not hard-coded twice)."""
+    in_worker = False
+    for line in (K8S / "fleet-core.yaml").read_text().splitlines():
+        if "name: worker" in line:
+            in_worker = True
+            continue
+        if in_worker and line.strip().startswith("- name:") and "worker" not in line:
+            break
+        if in_worker and "mountPath:" in line:
+            return line.split("mountPath:", 1)[1].strip().strip("}]'\"")
+    raise AssertionError("fleet-core worker data mountPath not found")
+
+
+def test_claude_config_dir_lives_on_data_volume():
+    value = _configmap_value("CLAUDE_CONFIG_DIR")
+    assert value is not None, "fleet ConfigMap must set CLAUDE_CONFIG_DIR"
+    mount = _worker_data_mount()
+    assert value == mount or value.startswith(mount.rstrip("/") + "/"), (
+        f"CLAUDE_CONFIG_DIR={value!r} must be under worker mount {mount!r}"
+    )

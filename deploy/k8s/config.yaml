@@ -15,6 +15,7 @@ data:
   FLEET_GRACE_SECONDS: "3600"
   FLEET_DEFER_SECONDS: "3600"
   FLEET_CLAUDE_MAX_RUNS_PER_DAY: "24"
+  CLAUDE_CONFIG_DIR: /data/claude   # MCP + settings survive pod restarts (only /data is persistent)
   FLEET_HEALTH_PORT: "8686"
   FLEET_USER_AGENT: fleet-watcher/0.2 (personal monitoring)
   FLEET_FALLBACK_LLM_URL: https://openrouter.ai/api/v1
