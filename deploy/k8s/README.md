@@ -106,7 +106,8 @@ to `http://ntfy.<tailnet>.ts.net/fleet-alerts` (phone on the tailnet).
 **Claude Code MCP / permissions** (once per cluster): MCP servers and
 permissions that `claude` jobs need are set up once with
 `kubectl -n fleet exec deploy/fleet-core -c worker -- claude mcp add --scope user ...`.
-They persist in `/data/claude`, which the nightly backup also covers.
+They persist in `/data/claude` across restarts and deploys. The nightly backup copies only `fleet.db`, so
+after restoring from a backup run the setup again.
 
 ## 3b. Shipping a code change
 
