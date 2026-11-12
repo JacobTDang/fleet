@@ -37,11 +37,14 @@ check() {
         need "user $u expires in 365d" "chage -l $u | grep -q 'Maximum number of days between password change\s*:\s*365'"
     done
     need "guest agent running"      "systemctl is-active --quiet qemu-guest-agent"
+    need "cloud-init disabled"      "[ -f /etc/cloud/cloud-init.disabled ]"
     need "k3s: no traefik/servicelb" "grep -qx '  - traefik' /etc/rancher/k3s/config.yaml && grep -qx '  - servicelb' /etc/rancher/k3s/config.yaml"
     need "k3s: secrets encrypted"   "grep -qx 'secrets-encryption: true' /etc/rancher/k3s/config.yaml"
     if command -v k3s >/dev/null; then
         need "k3s: encryption enabled"  "k3s secrets-encrypt status | grep -q 'Encryption Status: Enabled'"
-        need "k3s: no LoadBalancer svc" "! k3s kubectl get svc -A --no-headers | grep -q LoadBalancer"
+        # ServiceLB would publish LoadBalancer services on the LAN; the Tailscale operator's
+        # loadBalancerClass is allowed — those services are only served on the tailnet.
+        need "k3s: no LoadBalancer svc" "k3s kubectl get svc -A -o json | jq -e '[.items[] | select(.spec.type==\"LoadBalancer\" and (.spec.loadBalancerClass // \"\") != \"tailscale\")] | length == 0'"
     fi
     return $bad
 }
@@ -160,6 +163,14 @@ if systemctl is-active --quiet k3s; then
         k3s kubectl -n kube-system delete svc traefik --wait=false
     fi
 fi
+
+# Disable cloud-init so a regenerated cloud-init drive (for example after a Proxmox migration) cannot
+# re-run first-boot steps on a hardened host.
+mkdir -p /etc/cloud
+cat > /etc/cloud/cloud-init.disabled <<'EOF'
+# Disabled by fleet harden.sh: a regenerated cloud-init drive, for example after a migration,
+# must not re-run first-boot steps on a hardened host.
+EOF
 
 echo
 check
